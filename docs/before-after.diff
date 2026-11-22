@@ -1,0 +1,2710 @@
+diff --git a/extension/background/serviceWorker.js b/extension/background/serviceWorker.js
+index a267307..bb5f093 100644
+--- a/extension/background/serviceWorker.js
++++ b/extension/background/serviceWorker.js
+@@ -135,16 +135,18 @@ async function performTabScan(tabId, url, formMetadata = null, socialMeta = null
+ 
+   // 2. Correlate Real-Time Behavioral Events from EventStore
+   const tabEvents = globalEventStore.getTabEvents(tabId);
+-  const correlated = correlateSecurityEvents(tabId, url, tabEvents);
++  const correlated = correlateSecurityEvents({tabId, url, domain: analysis.domain, events: tabEvents, ...analysis.features?.reputation});
+ 
+   // If compound event correlation identified higher severity threats, merge signals
+-  if (correlated.score > analysis.score) {
++  if (settings.protectionEnabled && correlated.score > analysis.score) {
+     analysis.score = Math.min(100, Math.max(analysis.score, correlated.score));
+     analysis.verdict = correlated.verdict;
+     analysis.severity = correlated.severity;
+     
+     // Add compound signals to analysis
+-    for (const sig of correlated.signals) {
++    analysis.reasons = [...new Set([...correlated.reasons, ...analysis.reasons])];
++    for (const ev of correlated.evidence) {
++      const sig = {...ev, description: ev.explanation, category: 'BEHAVIORAL', evidence: ev.evidenceMetadata};
+       if (!analysis.signals.some(s => s.type === sig.type)) {
+         analysis.signals.push(sig);
+       }
+@@ -314,9 +316,9 @@ if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
+         }
+ 
+         if (pageUrl) {
+-          const networkEvent = createNetworkSecurityEvent(details.tabId, pageUrl, targetUrl, method, details.type);
++          const networkEvent = createNetworkSecurityEvent({tabId: details.tabId, pageUrl, requestUrl: targetUrl, method, type: details.type}, !!tabDomMetadata.get(details.tabId)?.formMetadata?.hasPasswordInput);
+           if (networkEvent) {
+-            globalEventStore.addEvent(networkEvent);
++            globalEventStore.recordEvent(networkEvent);
+ 
+             // If a cross-origin POST happens on a page with credential inputs, re-evaluate tab scan
+             if (networkEvent.isCrossOrigin && method === 'POST') {
+@@ -383,9 +385,10 @@ chrome.webNavigation.onCommitted.addListener((details) => {
+     globalEventStore.clearTab(tabId);
+   }
+ 
+-  const navEvent = createNavigationSecurityEvent(tabId, history.hops.map(h => h.url));
++  tabDomMetadata.delete(tabId);
++  const navEvent = createNavigationSecurityEvent({tabId, url: details.url, previousUrl: history.hops.at(-2)?.url, transitionType: details.transitionType}, history.hops.map(h => h.url));
+   if (navEvent) {
+-    globalEventStore.addEvent(navEvent);
++    globalEventStore.recordEvent(navEvent);
+   }
+ 
+   performTabScan(details.tabId, details.url);
+@@ -421,15 +424,9 @@ if (chrome.downloads && chrome.downloads.onCreated) {
+ 
+         tabDownloadContexts.set(activeTab.id, downloadContext);
+ 
+-        const dlEvent = createDownloadSecurityEvent(
+-          activeTab.id,
+-          activeTab.url || '',
+-          downloadItem.url,
+-          filename,
+-          originRiskScore
+-        );
++        const dlEvent = createDownloadSecurityEvent({tabId: activeTab.id, downloadId: downloadItem.id, originUrl: activeTab.url || "", url: downloadItem.url, filename, originRiskScore});
+         if (dlEvent) {
+-          globalEventStore.addEvent(dlEvent);
++          globalEventStore.recordEvent(dlEvent);
+         }
+ 
+         // If download initiated from high risk origin, re-evaluate tab score and badge
+@@ -480,19 +477,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+     const url = sender.tab?.url || message.url;
+     if (tabId && url) {
+       // Record Form Security Event
+-      if (message.formMetadata) {
+-        const formEvent = createFormSecurityEvent(tabId, url, message.formMetadata);
+-        if (formEvent) globalEventStore.addEvent(formEvent);
++      for (const form of message.formMetadata?.suspiciousForms || []) {
++        globalEventStore.recordEvent(createFormSecurityEvent({...form, tabId, pageUrl: url, hiddenFieldCount: form.hiddenInputsCount}));
+       }
+ 
+       // Record Page Branding Event
+       const pageTitle = message.formMetadata?.pageTitle || '';
+       const visibleHeadings = message.socialMeta?.visibleHeadingsSample || [];
+-      const brandEvent = createPageBrandingEvent(tabId, url, pageTitle, visibleHeadings);
+-      if (brandEvent) globalEventStore.addEvent(brandEvent);
++      const brandEvent = createPageBrandingEvent({tabId, url, title: pageTitle, headings: visibleHeadings, formMetadata: message.formMetadata});
++      if (brandEvent) globalEventStore.recordEvent(brandEvent);
+ 
+       performTabScan(tabId, url, message.formMetadata, message.socialMeta).then(res => {
+-        sendResponse({ success: true, result: res });
++        sendResponse({ success: true, result: res, analysis: res });
+       });
+       return true; // async response
+     }
+diff --git a/extension/config/brands.js b/extension/config/brands.js
+index 62b71f0..5086180 100644
+--- a/extension/config/brands.js
++++ b/extension/config/brands.js
+@@ -1,199 +1,386 @@
+-const DEFAULT_PROTECTED_BRANDS = [
+-  {
+-    id: "vinted",
+-    name: "Vinted",
+-    canonicalDomains: [
+-      "vinted.com",
+-      "vinted.fr",
+-      "vinted.de",
+-      "vinted.co.uk",
+-      "vinted.es",
+-      "vinted.it",
+-      "vinted.pl",
+-      "vinted.lt",
+-      "vinted.cz",
+-      "vinted.nl",
+-      "vinted.be",
+-      "vinted.at",
+-      "vinted.se"
+-    ],
+-    keywords: ["vinted", "vintedmarket", "vinted-market", "secondhand", "vinted-verify"],
+-    category: "ECOMMERCE"
+-  },
+-  {
+-    id: "paypal",
+-    name: "PayPal",
+-    canonicalDomains: ["paypal.com", "paypal-objects.com", "paypal.me", "paypal-community.com"],
+-    keywords: ["paypal", "paypaii", "paypai", "paypal-verify", "paypal-security"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "stripe",
+-    name: "Stripe",
+-    canonicalDomains: ["stripe.com", "checkout.stripe.com", "stripe.network"],
+-    keywords: ["stripe", "stripe-checkout", "stripe-auth"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "steam",
+-    name: "Steam / Valve",
+-    canonicalDomains: ["steampowered.com", "steamcommunity.com", "valvesoftware.com"],
+-    keywords: ["steam", "steamcommunity", "steam-login", "steamguard"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "docusign",
+-    name: "DocuSign",
+-    canonicalDomains: ["docusign.com", "docusign.net"],
+-    keywords: ["docusign", "docusign-sign", "docusign-envelope"],
+-    category: "PRODUCTIVITY"
+-  },
+-  {
+-    id: "dhl",
+-    name: "DHL Express",
+-    canonicalDomains: ["dhl.com", "dhl.de", "dhl.co.uk"],
+-    keywords: ["dhl", "dhl-tracking", "dhl-delivery"],
+-    category: "OTHER"
+-  },
+-  {
+-    id: "google",
+-    name: "Google / Gmail",
+-    canonicalDomains: ["google.com", "google.co.uk", "google.ca", "gmail.com", "accounts.google.com", "gstatic.com", "googleusercontent.com"],
+-    keywords: ["google", "gmail", "g00gle", "goog1e", "google-verify", "google-security"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "microsoft",
+-    name: "Microsoft / Outlook / Office",
+-    canonicalDomains: ["microsoft.com", "live.com", "office.com", "office365.com", "outlook.com", "microsoftonline.com", "msn.com", "sharepoint.com"],
+-    keywords: ["microsoft", "outlook", "office365", "micros0ft", "ms-online", "office-update"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "apple",
+-    name: "Apple / iCloud",
+-    canonicalDomains: ["apple.com", "icloud.com", "appleid.apple.com", "itunes.com"],
+-    keywords: ["apple", "icloud", "appl-id", "apple-id", "apple-support", "icloud-find"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "amazon",
+-    name: "Amazon",
+-    canonicalDomains: ["amazon.com", "amazon.co.uk", "amazon.de", "aws.amazon.com", "media-amazon.com"],
+-    keywords: ["amazon", "amaz0n", "amazon-order", "amazon-security", "aws-login"],
+-    category: "ECOMMERCE"
+-  },
+-  {
+-    id: "netflix",
+-    name: "Netflix",
+-    canonicalDomains: ["netflix.com", "nflxvideo.net"],
+-    keywords: ["netflix", "netf1ix", "netflix-verify", "netflix-billing"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "chase",
+-    name: "Chase Bank",
+-    canonicalDomains: ["chase.com", "jpmorganchase.com"],
+-    keywords: ["chase", "chase-online", "chase-security", "chase-verify"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "wellsfargo",
+-    name: "Wells Fargo",
+-    canonicalDomains: ["wellsfargo.com"],
+-    keywords: ["wellsfargo", "wells-fargo", "wf-online", "wellsfargo-verify"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "bankofamerica",
+-    name: "Bank of America",
+-    canonicalDomains: ["bankofamerica.com", "bofa.com"],
+-    keywords: ["bankofamerica", "bofa", "bofa-security", "bankofamerica-login"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "facebook",
+-    name: "Meta / Facebook / Instagram",
+-    canonicalDomains: ["facebook.com", "fb.com", "instagram.com", "meta.com", "messenger.com"],
+-    keywords: ["facebook", "instagram", "faceb00k", "fb-verify", "meta-auth"],
+-    category: "SOCIAL"
+-  },
+-  {
+-    id: "binance",
+-    name: "Binance",
+-    canonicalDomains: ["binance.com", "binance.us", "bnbstatic.com"],
+-    keywords: ["binance", "binance-auth", "binance-verify", "binance-wallet"],
+-    category: "CRYPTO"
+-  },
+-  {
+-    id: "coinbase",
+-    name: "Coinbase",
+-    canonicalDomains: ["coinbase.com", "pro.coinbase.com"],
+-    keywords: ["coinbase", "c0inbase", "coinbase-login", "coinbase-verify"],
+-    category: "CRYPTO"
+-  },
+-  {
+-    id: "github",
+-    name: "GitHub",
+-    canonicalDomains: ["github.com", "github.io", "githubusercontent.com", "github.blog"],
+-    keywords: ["github", "g1thub", "github-login", "github-auth"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "dropbox",
+-    name: "Dropbox",
+-    canonicalDomains: ["dropbox.com", "dropboxstatic.com"],
+-    keywords: ["dropbox", "dr0pbox", "dropbox-verify", "dropbox-share"],
+-    category: "TECH"
+-  }
++export const DEFAULT_PROTECTED_BRANDS = [
++    {
++        id: 'twitter',
++        name: 'X / Twitter',
++        canonicalDomains: [
++            'x.com',
++            'twitter.com'
++        ],
++        keywords: [
++            'twitter'
++        ],
++        category: 'SOCIAL'
++    },
++    {
++        id: 'vinted',
++        name: 'Vinted',
++        canonicalDomains: [
++            'vinted.com',
++            'vinted.fr',
++            'vinted.de',
++            'vinted.co.uk',
++            'vinted.es',
++            'vinted.it',
++            'vinted.pl',
++            'vinted.lt',
++            'vinted.cz',
++            'vinted.nl',
++            'vinted.be',
++            'vinted.at',
++            'vinted.se'
++        ],
++        keywords: [
++            'vinted',
++            'vintedmarket',
++            'vinted-market',
++            'secondhand',
++            'vinted-verify'
++        ],
++        category: 'ECOMMERCE'
++    },
++    {
++        id: 'paypal',
++        name: 'PayPal',
++        canonicalDomains: [
++            'paypal.com',
++            'paypal-objects.com',
++            'paypal.me',
++            'paypal-community.com'
++        ],
++        keywords: [
++            'paypal',
++            'paypaii',
++            'paypai',
++            'paypal-verify',
++            'paypal-security'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'stripe',
++        name: 'Stripe',
++        canonicalDomains: [
++            'stripe.com',
++            'checkout.stripe.com',
++            'stripe.network'
++        ],
++        keywords: [
++            'stripe',
++            'stripe-checkout',
++            'stripe-auth'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'steam',
++        name: 'Steam / Valve',
++        canonicalDomains: [
++            'steampowered.com',
++            'steamcommunity.com',
++            'valvesoftware.com'
++        ],
++        keywords: [
++            'steam',
++            'steamcommunity',
++            'steam-login',
++            'steamguard'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'docusign',
++        name: 'DocuSign',
++        canonicalDomains: [
++            'docusign.com',
++            'docusign.net'
++        ],
++        keywords: [
++            'docusign',
++            'docusign-sign',
++            'docusign-envelope'
++        ],
++        category: 'PRODUCTIVITY'
++    },
++    {
++        id: 'dhl',
++        name: 'DHL Express',
++        canonicalDomains: [
++            'dhl.com',
++            'dhl.de',
++            'dhl.co.uk'
++        ],
++        keywords: [
++            'dhl',
++            'dhl-tracking',
++            'dhl-delivery'
++        ],
++        category: 'OTHER'
++    },
++    {
++        id: 'google',
++        name: 'Google / Gmail',
++        canonicalDomains: [
++            'google.com',
++            'google.co.uk',
++            'google.ca',
++            'gmail.com',
++            'accounts.google.com',
++            'gstatic.com',
++            'googleusercontent.com'
++        ],
++        keywords: [
++            'google',
++            'gmail',
++            'g00gle',
++            'goog1e',
++            'google-verify',
++            'google-security'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'microsoft',
++        name: 'Microsoft / Outlook / Office',
++        canonicalDomains: [
++            'microsoft.com',
++            'live.com',
++            'office.com',
++            'office365.com',
++            'outlook.com',
++            'microsoftonline.com',
++            'msn.com',
++            'sharepoint.com'
++        ],
++        keywords: [
++            'microsoft',
++            'outlook',
++            'office365',
++            'micros0ft',
++            'ms-online',
++            'office-update'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'apple',
++        name: 'Apple / iCloud',
++        canonicalDomains: [
++            'apple.com',
++            'icloud.com',
++            'appleid.apple.com',
++            'itunes.com'
++        ],
++        keywords: [
++            'apple',
++            'icloud',
++            'appl-id',
++            'apple-id',
++            'apple-support',
++            'icloud-find'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'amazon',
++        name: 'Amazon',
++        canonicalDomains: [
++            'amazon.com',
++            'amazon.co.uk',
++            'amazon.de',
++            'aws.amazon.com',
++            'media-amazon.com'
++        ],
++        keywords: [
++            'amazon',
++            'amaz0n',
++            'amazon-order',
++            'amazon-security',
++            'aws-login'
++        ],
++        category: 'ECOMMERCE'
++    },
++    {
++        id: 'netflix',
++        name: 'Netflix',
++        canonicalDomains: [
++            'netflix.com',
++            'nflxvideo.net'
++        ],
++        keywords: [
++            'netflix',
++            'netf1ix',
++            'netflix-verify',
++            'netflix-billing'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'chase',
++        name: 'Chase Bank',
++        canonicalDomains: [
++            'chase.com',
++            'jpmorganchase.com'
++        ],
++        keywords: [
++            'chase',
++            'chase-online',
++            'chase-security',
++            'chase-verify'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'wellsfargo',
++        name: 'Wells Fargo',
++        canonicalDomains: [
++            'wellsfargo.com'
++        ],
++        keywords: [
++            'wellsfargo',
++            'wells-fargo',
++            'wf-online',
++            'wellsfargo-verify'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'bankofamerica',
++        name: 'Bank of America',
++        canonicalDomains: [
++            'bankofamerica.com',
++            'bofa.com'
++        ],
++        keywords: [
++            'bankofamerica',
++            'bofa',
++            'bofa-security',
++            'bankofamerica-login'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'facebook',
++        name: 'Meta / Facebook / Instagram',
++        canonicalDomains: [
++            'facebook.com',
++            'fb.com',
++            'instagram.com',
++            'meta.com',
++            'messenger.com'
++        ],
++        keywords: [
++            'facebook',
++            'instagram',
++            'faceb00k',
++            'fb-verify',
++            'meta-auth'
++        ],
++        category: 'SOCIAL'
++    },
++    {
++        id: 'binance',
++        name: 'Binance',
++        canonicalDomains: [
++            'binance.com',
++            'binance.us',
++            'bnbstatic.com'
++        ],
++        keywords: [
++            'binance',
++            'binance-auth',
++            'binance-verify',
++            'binance-wallet'
++        ],
++        category: 'CRYPTO'
++    },
++    {
++        id: 'coinbase',
++        name: 'Coinbase',
++        canonicalDomains: [
++            'coinbase.com',
++            'pro.coinbase.com'
++        ],
++        keywords: [
++            'coinbase',
++            'c0inbase',
++            'coinbase-login',
++            'coinbase-verify'
++        ],
++        category: 'CRYPTO'
++    },
++    {
++        id: 'github',
++        name: 'GitHub',
++        canonicalDomains: [
++            'github.com',
++            'githubusercontent.com',
++            'github.blog'
++        ],
++        keywords: [
++            'github',
++            'g1thub',
++            'github-login',
++            'github-auth'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'dropbox',
++        name: 'Dropbox',
++        canonicalDomains: [
++            'dropbox.com',
++            'dropboxstatic.com'
++        ],
++        keywords: [
++            'dropbox',
++            'dr0pbox',
++            'dropbox-verify',
++            'dropbox-share'
++        ],
++        category: 'TECH'
++    }
+ ];
+-const DEFAULT_ALLOWLIST = [
+-  "google.com",
+-  "accounts.google.com",
+-  "mail.google.com",
+-  "microsoft.com",
+-  "login.microsoftonline.com",
+-  "apple.com",
+-  "appleid.apple.com",
+-  "amazon.com",
+-  "paypal.com",
+-  "github.com",
+-  "cloudflare.com",
+-  "wikipedia.org",
+-  "mozilla.org",
+-  "developer.chrome.com",
+-  "nytimes.com",
+-  "bbc.com",
+-  "cnn.com",
+-  "stackexchange.com",
+-  "stackoverflow.com"
++export const DEFAULT_ALLOWLIST = [
++    'google.com',
++    'accounts.google.com',
++    'mail.google.com',
++    'microsoft.com',
++    'login.microsoftonline.com',
++    'apple.com',
++    'appleid.apple.com',
++    'amazon.com',
++    'paypal.com',
++    'github.com',
++    'cloudflare.com',
++    'wikipedia.org',
++    'mozilla.org',
++    'developer.chrome.com',
++    'nytimes.com',
++    'bbc.com',
++    'cnn.com',
++    'stackexchange.com',
++    'stackoverflow.com'
+ ];
+-const DEMO_KNOWN_MALICIOUS_DOMAINS = [
+-  "paypal-security-verification-login.com",
+-  "secure-apple-id-verify.online",
+-  "accounts-google-auth-login.xyz",
+-  "chase-online-banking-alert.click",
+-  "netflix-payment-failed-update.top",
+-  "binance-wallet-synchronize.cfd",
+-  "microsoft-365-passcode-reset.vip"
++export const DEMO_KNOWN_MALICIOUS_DOMAINS = [
++    'paypal-security-verification-login.com',
++    'secure-apple-id-verify.online',
++    'accounts-google-auth-login.xyz',
++    'chase-online-banking-alert.click',
++    'netflix-payment-failed-update.top',
++    'binance-wallet-synchronize.cfd',
++    'microsoft-365-passcode-reset.vip'
+ ];
+-const KNOWN_URL_SHORTENERS = [
+-  "bit.ly",
+-  "tinyurl.com",
+-  "t.co",
+-  "goo.gl",
+-  "is.gd",
+-  "buff.ly",
+-  "ow.ly",
+-  "cutt.ly",
+-  "rebrand.ly",
+-  "shorte.st",
+-  "tiny.cc",
+-  "bc.vc"
++export const KNOWN_URL_SHORTENERS = [
++    'bit.ly',
++    'tinyurl.com',
++    't.co',
++    'goo.gl',
++    'is.gd',
++    'buff.ly',
++    'ow.ly',
++    'cutt.ly',
++    'rebrand.ly',
++    'shorte.st',
++    'tiny.cc',
++    'bc.vc'
+ ];
+-export {
+-  DEFAULT_ALLOWLIST,
+-  DEFAULT_PROTECTED_BRANDS,
+-  DEMO_KNOWN_MALICIOUS_DOMAINS,
+-  KNOWN_URL_SHORTENERS
+-};
+diff --git a/extension/content/contentScript.js b/extension/content/contentScript.js
+index 9387034..42b4eb3 100644
+--- a/extension/content/contentScript.js
++++ b/extension/content/contentScript.js
+@@ -112,6 +112,9 @@
+           method: (form.getAttribute('method') || 'GET').toUpperCase(),
+           isCrossOrigin,
+           isInsecureHttp,
++          hasCreditCardField: !!form.querySelector('input[autocomplete^="cc-"],input[name*="card" i]'),
++          has2FAField: !!form.querySelector('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="2fa" i]'),
++          identityLabels: Array.from(form.querySelectorAll('legend,h1,h2,h3,button,label')).slice(0,12).filter(el => !el.closest('[contenteditable]')).map(el => Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').trim().slice(0,100)).filter(Boolean),
+           hasPasswordField: formPasswordFields.length > 0,
+           inputCount: form.querySelectorAll('input, select, textarea').length,
+           hiddenInputsCount: hiddenInputs.length
+@@ -175,7 +178,7 @@
+         visibleHeadingsSample: visibleHeadingsSample.slice(0, 5)
+       };
+ 
+-      const stateHash = `${hasPasswordInput}_${hasCreditCardInput}_${forms.length}_${suspiciousForms.length}_${detectedPhrases.length}_${document.title}`;
++      const stateHash = `${hasPasswordInput}_${hasCreditCardInput}_${forms.length}_${JSON.stringify(suspiciousForms.map(f => [f.hasPasswordField,f.has2FAField,f.identityLabels]))}_${detectedPhrases.length}_${document.title}`;
+       if (stateHash === lastReportedHash) return;
+       lastReportedHash = stateHash;
+ 
+diff --git a/extension/engine/brandIdentity.js b/extension/engine/brandIdentity.js
+index ed53c53..3ccc777 100644
+--- a/extension/engine/brandIdentity.js
++++ b/extension/engine/brandIdentity.js
+@@ -1,427 +1,642 @@
+-const KNOWN_BRANDS = [
+-  {
+-    id: "vinted",
+-    name: "Vinted",
+-    canonicalDomains: [
+-      "vinted.com",
+-      "vinted.fr",
+-      "vinted.de",
+-      "vinted.co.uk",
+-      "vinted.es",
+-      "vinted.it",
+-      "vinted.pl",
+-      "vinted.lt",
+-      "vinted.cz",
+-      "vinted.nl",
+-      "vinted.be",
+-      "vinted.at",
+-      "vinted.se"
+-    ],
+-    aliases: ["vinted", "vinted uk", "vinted marketplace", "vinted fr", "vinted de"],
+-    keywords: ["vinted", "vintedmarket", "second hand", "wardrobe", "vinted balance"],
+-    category: "ECOMMERCE"
+-  },
+-  {
+-    id: "jumia",
+-    name: "Jumia",
+-    canonicalDomains: [
+-      "jumia.com",
+-      "jumia.com.ng",
+-      "jumia.co.ke",
+-      "jumia.ma",
+-      "jumia.ci",
+-      "jumia.ug",
+-      "jumia.com.gh",
+-      "jumia.com.eg"
+-    ],
+-    aliases: ["jumia", "jumia store", "jumia online", "jumia market"],
+-    keywords: ["jumia", "jumia store", "jumia market", "jumia pay"],
+-    category: "ECOMMERCE"
+-  },
+-  {
+-    id: "paypal",
+-    name: "PayPal",
+-    canonicalDomains: ["paypal.com", "paypal-objects.com", "paypal.me", "paypal-community.com"],
+-    knownAuthDomains: ["www.paypal.com/signin", "paypal.com/auth"],
+-    knownPaymentDomains: ["checkout.paypal.com", "paypal.com/checkout"],
+-    aliases: ["paypal", "paypal inc", "paypal security"],
+-    keywords: ["paypal", "paypaii", "paypai", "paypal balance", "send money"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "google",
+-    name: "Google / Gmail",
+-    canonicalDomains: ["google.com", "google.co.uk", "google.ca", "gmail.com", "accounts.google.com", "gstatic.com", "googleusercontent.com"],
+-    knownAuthDomains: ["accounts.google.com"],
+-    aliases: ["google", "gmail", "google workspace", "google account"],
+-    keywords: ["google", "gmail", "g00gle", "goog1e", "google sign in"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "microsoft",
+-    name: "Microsoft / Outlook / Office",
+-    canonicalDomains: ["microsoft.com", "live.com", "office.com", "office365.com", "outlook.com", "microsoftonline.com", "msn.com", "sharepoint.com"],
+-    knownAuthDomains: ["login.microsoftonline.com", "login.live.com"],
+-    aliases: ["microsoft", "outlook", "office 365", "microsoft 365"],
+-    keywords: ["microsoft", "outlook", "office365", "micros0ft", "ms-online"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "apple",
+-    name: "Apple / iCloud",
+-    canonicalDomains: ["apple.com", "icloud.com", "appleid.apple.com", "itunes.com"],
+-    knownAuthDomains: ["appleid.apple.com"],
+-    aliases: ["apple", "icloud", "apple id"],
+-    keywords: ["apple", "icloud", "appl-id", "apple-id", "apple id sign in"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "amazon",
+-    name: "Amazon",
+-    canonicalDomains: ["amazon.com", "amazon.co.uk", "amazon.de", "aws.amazon.com", "media-amazon.com"],
+-    aliases: ["amazon", "aws", "amazon prime"],
+-    keywords: ["amazon", "amaz0n", "amazon prime", "amazon order"],
+-    category: "ECOMMERCE"
+-  },
+-  {
+-    id: "netflix",
+-    name: "Netflix",
+-    canonicalDomains: ["netflix.com", "nflxvideo.net", "netflix.net"],
+-    aliases: ["netflix", "netflix streaming"],
+-    keywords: ["netflix", "netf1ix", "netflix account", "netflix billing"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "chase",
+-    name: "Chase Bank",
+-    canonicalDomains: ["chase.com", "jpmorganchase.com"],
+-    aliases: ["chase", "jpmorgan chase", "chase online"],
+-    keywords: ["chase", "chase bank", "chase online", "jpmorgan"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "wellsfargo",
+-    name: "Wells Fargo",
+-    canonicalDomains: ["wellsfargo.com"],
+-    aliases: ["wells fargo", "wf bank"],
+-    keywords: ["wellsfargo", "wells fargo", "wf online"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "bankofamerica",
+-    name: "Bank of America",
+-    canonicalDomains: ["bankofamerica.com", "bofa.com"],
+-    aliases: ["bank of america", "bofa"],
+-    keywords: ["bankofamerica", "bofa", "bofa online banking"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "meta",
+-    name: "Meta / Facebook / Instagram",
+-    canonicalDomains: ["facebook.com", "fb.com", "instagram.com", "meta.com", "messenger.com", "whatsapp.com"],
+-    aliases: ["facebook", "instagram", "meta", "whatsapp"],
+-    keywords: ["facebook", "instagram", "meta", "fb login"],
+-    category: "SOCIAL"
+-  },
+-  {
+-    id: "binance",
+-    name: "Binance",
+-    canonicalDomains: ["binance.com", "binance.us", "bnbstatic.com"],
+-    aliases: ["binance", "binance exchange"],
+-    keywords: ["binance", "binance wallet", "bnb"],
+-    category: "CRYPTO"
+-  },
+-  {
+-    id: "coinbase",
+-    name: "Coinbase",
+-    canonicalDomains: ["coinbase.com", "pro.coinbase.com"],
+-    aliases: ["coinbase", "coinbase exchange"],
+-    keywords: ["coinbase", "c0inbase", "coinbase wallet"],
+-    category: "CRYPTO"
+-  },
+-  {
+-    id: "github",
+-    name: "GitHub",
+-    canonicalDomains: ["github.com", "github.io", "githubusercontent.com", "github.blog"],
+-    aliases: ["github", "github inc"],
+-    keywords: ["github", "g1thub", "github sign in"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "stripe",
+-    name: "Stripe",
+-    canonicalDomains: ["stripe.com", "checkout.stripe.com", "stripe.network"],
+-    aliases: ["stripe", "stripe payments"],
+-    keywords: ["stripe", "stripe checkout", "powered by stripe"],
+-    category: "FINANCIAL"
+-  },
+-  {
+-    id: "steam",
+-    name: "Steam / Valve",
+-    canonicalDomains: ["steampowered.com", "steamcommunity.com", "valvesoftware.com"],
+-    aliases: ["steam", "valve", "steam community"],
+-    keywords: ["steam", "steam community", "steam login", "steam guard"],
+-    category: "TECH"
+-  },
+-  {
+-    id: "docusign",
+-    name: "DocuSign",
+-    canonicalDomains: ["docusign.com", "docusign.net"],
+-    aliases: ["docusign", "docusign inc"],
+-    keywords: ["docusign", "sign document", "docusign envelope"],
+-    category: "PRODUCTIVITY"
+-  },
+-  {
+-    id: "dhl",
+-    name: "DHL Express",
+-    canonicalDomains: ["dhl.com", "dhl.de", "dhl.co.uk", "dhl-express.com"],
+-    aliases: ["dhl", "dhl express"],
+-    keywords: ["dhl", "dhl tracking", "dhl delivery", "shipment delivery"],
+-    category: "LOGISTICS"
+-  }
++export const KNOWN_BRANDS = [
++    {
++        id: 'twitter',
++        name: 'X / Twitter',
++        canonicalDomains: [
++            'x.com',
++            'twitter.com'
++        ],
++        keywords: [
++            'twitter'
++        ],
++        category: 'SOCIAL',
++        aliases: [
++            'twitter',
++            'x'
++        ]
++    },
++    {
++        id: 'vinted',
++        name: 'Vinted',
++        canonicalDomains: [
++            'vinted.com',
++            'vinted.fr',
++            'vinted.de',
++            'vinted.co.uk',
++            'vinted.es',
++            'vinted.it',
++            'vinted.pl',
++            'vinted.lt',
++            'vinted.cz',
++            'vinted.nl',
++            'vinted.be',
++            'vinted.at',
++            'vinted.se'
++        ],
++        aliases: [
++            'vinted',
++            'vinted uk',
++            'vinted marketplace',
++            'vinted fr',
++            'vinted de'
++        ],
++        keywords: [
++            'vinted',
++            'vintedmarket',
++            'second hand',
++            'wardrobe',
++            'vinted balance'
++        ],
++        category: 'ECOMMERCE'
++    },
++    {
++        id: 'jumia',
++        name: 'Jumia',
++        canonicalDomains: [
++            'jumia.com',
++            'jumia.com.ng',
++            'jumia.co.ke',
++            'jumia.ma',
++            'jumia.ci',
++            'jumia.ug',
++            'jumia.com.gh',
++            'jumia.com.eg'
++        ],
++        aliases: [
++            'jumia',
++            'jumia store',
++            'jumia online',
++            'jumia market'
++        ],
++        keywords: [
++            'jumia',
++            'jumia store',
++            'jumia market',
++            'jumia pay'
++        ],
++        category: 'ECOMMERCE'
++    },
++    {
++        id: 'paypal',
++        name: 'PayPal',
++        canonicalDomains: [
++            'paypal.com',
++            'paypal-objects.com',
++            'paypal.me',
++            'paypal-community.com'
++        ],
++        knownAuthDomains: [
++            'www.paypal.com/signin',
++            'paypal.com/auth'
++        ],
++        knownPaymentDomains: [
++            'checkout.paypal.com',
++            'paypal.com/checkout'
++        ],
++        aliases: [
++            'paypal',
++            'paypal inc',
++            'paypal security'
++        ],
++        keywords: [
++            'paypal',
++            'paypaii',
++            'paypai',
++            'paypal balance',
++            'send money'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'google',
++        name: 'Google / Gmail',
++        canonicalDomains: [
++            'google.com',
++            'google.co.uk',
++            'google.ca',
++            'gmail.com',
++            'accounts.google.com',
++            'gstatic.com',
++            'googleusercontent.com'
++        ],
++        knownAuthDomains: [
++            'accounts.google.com'
++        ],
++        aliases: [
++            'google',
++            'gmail',
++            'google workspace',
++            'google account'
++        ],
++        keywords: [
++            'google',
++            'gmail',
++            'g00gle',
++            'goog1e',
++            'google sign in'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'microsoft',
++        name: 'Microsoft / Outlook / Office',
++        canonicalDomains: [
++            'microsoft.com',
++            'live.com',
++            'office.com',
++            'office365.com',
++            'outlook.com',
++            'microsoftonline.com',
++            'msn.com',
++            'sharepoint.com'
++        ],
++        knownAuthDomains: [
++            'login.microsoftonline.com',
++            'login.live.com'
++        ],
++        aliases: [
++            'microsoft',
++            'outlook',
++            'office 365',
++            'microsoft 365'
++        ],
++        keywords: [
++            'microsoft',
++            'outlook',
++            'office365',
++            'micros0ft',
++            'ms-online'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'apple',
++        name: 'Apple / iCloud',
++        canonicalDomains: [
++            'apple.com',
++            'icloud.com',
++            'appleid.apple.com',
++            'itunes.com'
++        ],
++        knownAuthDomains: [
++            'appleid.apple.com'
++        ],
++        aliases: [
++            'apple',
++            'icloud',
++            'apple id'
++        ],
++        keywords: [
++            'apple',
++            'icloud',
++            'appl-id',
++            'apple-id',
++            'apple id sign in'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'amazon',
++        name: 'Amazon',
++        canonicalDomains: [
++            'amazon.com',
++            'amazon.co.uk',
++            'amazon.de',
++            'aws.amazon.com',
++            'media-amazon.com'
++        ],
++        aliases: [
++            'amazon',
++            'aws',
++            'amazon prime'
++        ],
++        keywords: [
++            'amazon',
++            'amaz0n',
++            'amazon prime',
++            'amazon order'
++        ],
++        category: 'ECOMMERCE'
++    },
++    {
++        id: 'netflix',
++        name: 'Netflix',
++        canonicalDomains: [
++            'netflix.com',
++            'nflxvideo.net',
++            'netflix.net'
++        ],
++        aliases: [
++            'netflix',
++            'netflix streaming'
++        ],
++        keywords: [
++            'netflix',
++            'netf1ix',
++            'netflix account',
++            'netflix billing'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'chase',
++        name: 'Chase Bank',
++        canonicalDomains: [
++            'chase.com',
++            'jpmorganchase.com'
++        ],
++        aliases: [
++            'chase',
++            'jpmorgan chase',
++            'chase online'
++        ],
++        keywords: [
++            'chase',
++            'chase bank',
++            'chase online',
++            'jpmorgan'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'wellsfargo',
++        name: 'Wells Fargo',
++        canonicalDomains: [
++            'wellsfargo.com'
++        ],
++        aliases: [
++            'wells fargo',
++            'wf bank'
++        ],
++        keywords: [
++            'wellsfargo',
++            'wells fargo',
++            'wf online'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'bankofamerica',
++        name: 'Bank of America',
++        canonicalDomains: [
++            'bankofamerica.com',
++            'bofa.com'
++        ],
++        aliases: [
++            'bank of america',
++            'bofa'
++        ],
++        keywords: [
++            'bankofamerica',
++            'bofa',
++            'bofa online banking'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'meta',
++        name: 'Meta / Facebook / Instagram',
++        canonicalDomains: [
++            'facebook.com',
++            'fb.com',
++            'instagram.com',
++            'meta.com',
++            'messenger.com',
++            'whatsapp.com'
++        ],
++        aliases: [
++            'facebook',
++            'instagram',
++            'meta',
++            'whatsapp'
++        ],
++        keywords: [
++            'facebook',
++            'instagram',
++            'meta',
++            'fb login'
++        ],
++        category: 'SOCIAL'
++    },
++    {
++        id: 'binance',
++        name: 'Binance',
++        canonicalDomains: [
++            'binance.com',
++            'binance.us',
++            'bnbstatic.com'
++        ],
++        aliases: [
++            'binance',
++            'binance exchange'
++        ],
++        keywords: [
++            'binance',
++            'binance wallet',
++            'bnb'
++        ],
++        category: 'CRYPTO'
++    },
++    {
++        id: 'coinbase',
++        name: 'Coinbase',
++        canonicalDomains: [
++            'coinbase.com',
++            'pro.coinbase.com'
++        ],
++        aliases: [
++            'coinbase',
++            'coinbase exchange'
++        ],
++        keywords: [
++            'coinbase',
++            'c0inbase',
++            'coinbase wallet'
++        ],
++        category: 'CRYPTO'
++    },
++    {
++        id: 'github',
++        name: 'GitHub',
++        canonicalDomains: [
++            'github.com',
++            'githubusercontent.com',
++            'github.blog'
++        ],
++        aliases: [
++            'github',
++            'github inc'
++        ],
++        keywords: [
++            'github',
++            'g1thub',
++            'github sign in'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'stripe',
++        name: 'Stripe',
++        canonicalDomains: [
++            'stripe.com',
++            'checkout.stripe.com',
++            'stripe.network'
++        ],
++        aliases: [
++            'stripe',
++            'stripe payments'
++        ],
++        keywords: [
++            'stripe',
++            'stripe checkout',
++            'powered by stripe'
++        ],
++        category: 'FINANCIAL'
++    },
++    {
++        id: 'steam',
++        name: 'Steam / Valve',
++        canonicalDomains: [
++            'steampowered.com',
++            'steamcommunity.com',
++            'valvesoftware.com'
++        ],
++        aliases: [
++            'steam',
++            'valve',
++            'steam community'
++        ],
++        keywords: [
++            'steam',
++            'steam community',
++            'steam login',
++            'steam guard'
++        ],
++        category: 'TECH'
++    },
++    {
++        id: 'docusign',
++        name: 'DocuSign',
++        canonicalDomains: [
++            'docusign.com',
++            'docusign.net'
++        ],
++        aliases: [
++            'docusign',
++            'docusign inc'
++        ],
++        keywords: [
++            'docusign',
++            'sign document',
++            'docusign envelope'
++        ],
++        category: 'PRODUCTIVITY'
++    },
++    {
++        id: 'dhl',
++        name: 'DHL Express',
++        canonicalDomains: [
++            'dhl.com',
++            'dhl.de',
++            'dhl.co.uk',
++            'dhl-express.com'
++        ],
++        aliases: [
++            'dhl',
++            'dhl express'
++        ],
++        keywords: [
++            'dhl',
++            'dhl tracking',
++            'dhl delivery',
++            'shipment delivery'
++        ],
++        category: 'LOGISTICS'
++    }
+ ];
+-const FREE_HOSTING_PROVIDERS = {
+-  "netlify.app": "Netlify App Hosting",
+-  "vercel.app": "Vercel Platform",
+-  "firebaseapp.com": "Google Firebase",
+-  "web.app": "Google Firebase Web",
+-  "pages.dev": "Cloudflare Pages",
+-  "workers.dev": "Cloudflare Workers",
+-  "github.io": "GitHub Pages",
+-  "gitlab.io": "GitLab Pages",
+-  "glitch.me": "Glitch Hosting",
+-  "render.com": "Render Cloud",
+-  "onrender.com": "Render Cloud App",
+-  "surge.sh": "Surge Static Web",
+-  "herokuapp.com": "Heroku Cloud",
+-  "supabase.co": "Supabase Storage/Auth",
+-  "s3.amazonaws.com": "AWS S3 Bucket",
+-  "blob.core.windows.net": "Azure Blob Storage",
+-  "000webhostapp.com": "000Webhost Free Tier",
+-  "weebly.com": "Weebly Free Site",
+-  "wixsite.com": "Wix Free Subdomain",
+-  "sites.google.com": "Google Sites Free",
+-  "godaddysites.com": "GoDaddy Free Site Builder"
++export const FREE_HOSTING_PROVIDERS = {
++    'netlify.app': 'Netlify App Hosting',
++    'vercel.app': 'Vercel Platform',
++    'firebaseapp.com': 'Google Firebase',
++    'web.app': 'Google Firebase Web',
++    'pages.dev': 'Cloudflare Pages',
++    'workers.dev': 'Cloudflare Workers',
++    'github.io': 'GitHub Pages',
++    'gitlab.io': 'GitLab Pages',
++    'glitch.me': 'Glitch Hosting',
++    'render.com': 'Render Cloud',
++    'onrender.com': 'Render Cloud App',
++    'surge.sh': 'Surge Static Web',
++    'herokuapp.com': 'Heroku Cloud',
++    'supabase.co': 'Supabase Storage/Auth',
++    's3.amazonaws.com': 'AWS S3 Bucket',
++    'blob.core.windows.net': 'Azure Blob Storage',
++    '000webhostapp.com': '000Webhost Free Tier',
++    'weebly.com': 'Weebly Free Site',
++    'wixsite.com': 'Wix Free Subdomain',
++    'sites.google.com': 'Google Sites Free',
++    'godaddysites.com': 'GoDaddy Free Site Builder'
+ };
+-function extractRegisteredDomain(hostname) {
+-  const clean = hostname.toLowerCase().trim();
+-  const parts = clean.split(".");
+-  if (parts.length <= 2) return clean;
+-  const multiPartTlds = [
+-    "co.uk",
+-    "com.au",
+-    "co.nz",
+-    "co.jp",
+-    "com.br",
+-    "co.za",
+-    "gov.uk",
+-    "edu.au",
+-    "com.sg",
+-    "co.il",
+-    "com.ng",
+-    "co.ke",
+-    "com.gh",
+-    "com.eg",
+-    "net.au",
+-    "org.uk"
+-  ];
+-  const lastTwo = parts.slice(-2).join(".");
+-  if (multiPartTlds.includes(lastTwo) && parts.length >= 3) {
+-    return parts.slice(-3).join(".");
+-  }
+-  return parts.slice(-2).join(".");
++export function sharedHost(hostname) {
++    return Object.keys(FREE_HOSTING_PROVIDERS).find((provider)=>hostname === provider || hostname.endsWith('.' + provider));
+ }
+-function inferBrandIdentity(hostname, pageTitle, visibleTokens = [], formMeta, socialMeta, customBrands = KNOWN_BRANDS) {
+-  const cleanHostname = hostname.toLowerCase().trim();
+-  const registeredDomain = extractRegisteredDomain(cleanHostname);
+-  for (const brand of customBrands) {
+-    const isCanonical = brand.canonicalDomains.some((d) => cleanHostname === d || cleanHostname.endsWith("." + d));
+-    if (isCanonical) {
+-      return {
+-        candidateName: brand.name,
+-        confidence: 0.99,
+-        evidence: [`Matches verified canonical domain ${cleanHostname}`],
+-        source: "KNOWN_REGISTRY",
+-        isKnownBrand: true,
+-        knownBrandId: brand.id,
+-        canonicalDomains: brand.canonicalDomains
+-      };
+-    }
+-    const brandTokens = [brand.id, ...brand.keywords.map((k) => k.replace(/\s+/g, ""))];
+-    let hostMatch = false;
+-    let matchingToken = "";
+-    for (const token of brandTokens) {
+-      if (token.length >= 3 && cleanHostname.includes(token)) {
+-        hostMatch = true;
+-        matchingToken = token;
+-        break;
+-      }
+-    }
+-    let contextMatch = false;
+-    if (pageTitle && (pageTitle.toLowerCase().includes(brand.name.toLowerCase()) || brand.keywords.some((k) => pageTitle.toLowerCase().includes(k)))) {
+-      contextMatch = true;
++export function extractRegisteredDomain(hostname) {
++    const clean = hostname.toLowerCase().trim();
++    const parts = clean.split('.');
++    if (parts.length <= 2) return clean;
++    const multiPartTlds = [
++        'co.uk',
++        'com.au',
++        'co.nz',
++        'co.jp',
++        'com.br',
++        'co.za',
++        'gov.uk',
++        'edu.au',
++        'com.sg',
++        'co.il',
++        'com.ng',
++        'co.ke',
++        'com.gh',
++        'com.eg',
++        'net.au',
++        'org.uk'
++    ];
++    const lastTwo = parts.slice(-2).join('.');
++    if (multiPartTlds.includes(lastTwo) && parts.length >= 3) {
++        return parts.slice(-3).join('.');
+     }
+-    if (visibleTokens.some((t) => t.toLowerCase() === brand.name.toLowerCase() || brand.keywords.includes(t.toLowerCase()))) {
+-      contextMatch = true;
+-    }
+-    if (hostMatch || contextMatch) {
+-      const evidence = [];
+-      if (hostMatch) evidence.push(`Hostname contains brand token "${matchingToken}"`);
+-      if (contextMatch) evidence.push(`Page title or heading references brand "${brand.name}"`);
+-      return {
+-        candidateName: brand.name,
+-        confidence: hostMatch && contextMatch ? 0.95 : 0.85,
+-        evidence,
+-        source: "KNOWN_REGISTRY",
++    return parts.slice(-2).join('.');
++}
++export function inferBrandIdentity(hostname, pageTitle, visibleTokens = [], formMeta, socialMeta, customBrands = KNOWN_BRANDS) {
++    const host = hostname.trim().toLowerCase().replace(/\.$/, '');
++    const provider = sharedHost(host);
++    const tenant = provider ? host.slice(0, -(provider.length + 1)) : host;
++    const norm = (s)=>s.trim().toLowerCase().replace(/\s+/g, ' ');
++    const title = norm(pageTitle || '');
++    const headings = visibleTokens.map(norm);
++    const labels = (formMeta?.suspiciousForms || []).filter((f)=>f.hasPasswordField || f.has2FAField).flatMap((f)=>f.identityLabels || []).map(norm);
++    const rows = customBrands.map((brand)=>{
++        const names = [
++            brand.id,
++            ...brand.aliases,
++            brand.name
++        ].map(norm);
++        const login = (t, n)=>[
++                'sign in to ',
++                'log in to ',
++                'login to ',
++                'تسجيل الدخول إلى '
++            ].some((p)=>t === p + n) || [
++                ' login',
++                ' sign in',
++                ' account login'
++            ].some((p)=>t === n + p);
++        const formClaim = labels.some((t)=>names.some((n)=>login(t, n) || n.length > 1 && t === n));
++        const titleClaim = names.some((n)=>login(title, n) || n.length > 1 && title === n);
++        const hostMatch = [
++            brand.id,
++            ...brand.keywords
++        ].some((k)=>k.length >= 3 && tenant.includes(k.toLowerCase().replace(/\s+/g, '')));
++        const official = !provider && brand.canonicalDomains.some((d)=>host === d || host.endsWith('.' + d));
++        const mentioned = [
++            title,
++            ...headings
++        ].some((t)=>names.some((n)=>t === n || n.length > 1 && t.split(/[^\p{L}\p{N}]+/u).includes(n)));
++        return {
++            brand,
++            formClaim,
++            titleClaim,
++            hostMatch,
++            official,
++            mentioned
++        };
++    }).sort((a, b)=>a.brand.id.localeCompare(b.brand.id));
++    const owner = rows.find((r)=>r.official);
++    const row = rows.find((r)=>r.formClaim && r !== owner) || owner || rows.find((r)=>r.formClaim) || rows.find((r)=>r.titleClaim) || rows.find((r)=>r.hostMatch);
++    if (!row) return null;
++    return {
++        candidateName: row.brand.name,
++        confidence: row.official ? 0.99 : 0.85,
++        source: 'KNOWN_REGISTRY',
+         isKnownBrand: true,
+-        knownBrandId: brand.id,
+-        canonicalDomains: brand.canonicalDomains
+-      };
+-    }
+-  }
+-  const genericCandidates = [];
+-  if (pageTitle && pageTitle.trim().length > 2) {
+-    const titleClean = pageTitle.trim();
+-    const titleParts = titleClean.split(/\s*[-–—|:]\s*/).filter(Boolean);
+-    if (titleParts.length > 0) {
+-      const candidateTitleName = titleParts[0].trim();
+-      const isGenericNoise = /^(login|sign\s*in|welcome|home|index|untitled|page|loading|portal)$/i.test(candidateTitleName);
+-      if (!isGenericNoise && candidateTitleName.length >= 3 && candidateTitleName.length <= 35) {
+-        genericCandidates.push({
+-          name: candidateTitleName,
+-          confidence: 0.7,
+-          evidence: [`Document title prominently presents entity "${candidateTitleName}"`],
+-          source: "DOCUMENT_TITLE"
+-        });
+-      }
+-    }
+-  }
+-  let isFreeHosting = false;
+-  const hasFormsOrUrgency = !!(formMeta?.hasPasswordInput || formMeta?.hasCreditCardInput || formMeta?.has2FAInput || socialMeta?.hasUrgencyLanguage || socialMeta?.hasCredentialVerificationPrompt);
+-  for (const providerDomain of Object.keys(FREE_HOSTING_PROVIDERS)) {
+-    if (cleanHostname.endsWith(providerDomain)) {
+-      isFreeHosting = true;
+-      const subdomain = cleanHostname.replace("." + providerDomain, "").replace(/\./g, "-");
+-      const cleanedToken = subdomain.replace(/-(login|verify|security|portal|auth|update|support|checkout|payment|app)$/i, "").replace(/^(secure|my|login|auth|portal)-/i, "");
+-      const hasSecurityKeywords = /-(login|verify|security|portal|auth|update|support|checkout|payment)$/i.test(subdomain) || /^(secure|login|auth|portal)-/i.test(subdomain);
+-      if (cleanedToken.length >= 3 && !/^(www|app|test|dev|demo|stage|prod|api)$/i.test(cleanedToken)) {
+-        if (hasSecurityKeywords || hasFormsOrUrgency) {
+-          const formattedName = cleanedToken.charAt(0).toUpperCase() + cleanedToken.slice(1);
+-          genericCandidates.push({
+-            name: formattedName,
+-            confidence: 0.75,
+-            evidence: [`Free hosting subdomain "${subdomain}" claims identity "${formattedName}"`],
+-            source: "HOSTNAME_TOKEN"
+-          });
++        knownBrandId: row.brand.id,
++        domainOwnerId: owner?.brand.id,
++        mentionedBrandIds: rows.filter((r)=>r.mentioned).map((r)=>r.brand.id),
++        canonicalDomains: row.brand.canonicalDomains,
++        evidence: [
++            row.official ? 'Official domain' : row.formClaim ? 'Brand claim inside credential form' : row.titleClaim ? 'Page title claims this identity' : 'Brand token in hostname'
++        ]
++    };
++}
++export function evaluateBrandDomainMismatch(hostname, candidate) {
++    if (!candidate) return null;
++    const cleanHostname = hostname.toLowerCase().trim();
++    const registeredDomain = extractRegisteredDomain(cleanHostname);
++    let matchedFreeHosting;
++    for (const [providerDomain, providerName] of Object.entries(FREE_HOSTING_PROVIDERS)){
++        if (sharedHost(cleanHostname) === providerDomain) {
++            matchedFreeHosting = providerName;
++            break;
+         }
+-      }
+-      break;
+     }
+-  }
+-  for (const token of visibleTokens) {
+-    const authMatch = token.match(/(?:sign\s*in\s*to|log\s*in\s*to|welcome\s*to|verify\s*your)\s+([A-Za-z0-9\s]{3,25})/i);
+-    if (authMatch && authMatch[1]) {
+-      const extractedBrand = authMatch[1].trim();
+-      if (!/^(account|portal|website|page|service|system)$/i.test(extractedBrand)) {
+-        genericCandidates.push({
+-          name: extractedBrand,
+-          confidence: 0.8,
+-          evidence: [`Authentication heading declares "${token}"`],
+-          source: "HEADINGS"
+-        });
+-      }
++    const isOfficial = candidate.canonicalDomains.some((canonical)=>cleanHostname === canonical || cleanHostname.endsWith('.' + canonical) || registeredDomain === canonical);
++    if (!matchedFreeHosting && isOfficial) {
++        return {
++            candidate,
++            isOfficial: true,
++            isSubdomainAbuse: false,
++            isFreeHostingAbuse: false,
++            isCombosquat: false,
++            details: `Official verified ${candidate.candidateName} domain (${cleanHostname}).`
++        };
+     }
+-  }
+-  if (genericCandidates.length === 0) {
+-    return null;
+-  }
+-  genericCandidates.sort((a, b) => b.confidence - a.confidence);
+-  const best = genericCandidates[0];
+-  const inferredClean = best.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+-  const inferredCanonical = `${inferredClean}.com`;
+-  return {
+-    candidateName: best.name,
+-    confidence: best.confidence,
+-    evidence: best.evidence,
+-    source: best.source,
+-    isKnownBrand: false,
+-    canonicalDomains: [inferredCanonical]
+-  };
+-}
+-function evaluateBrandDomainMismatch(hostname, candidate) {
+-  if (!candidate) return null;
+-  const cleanHostname = hostname.toLowerCase().trim();
+-  const registeredDomain = extractRegisteredDomain(cleanHostname);
+-  let matchedFreeHosting;
+-  for (const [providerDomain, providerName] of Object.entries(FREE_HOSTING_PROVIDERS)) {
+-    if (cleanHostname.endsWith(providerDomain) || cleanHostname === providerDomain) {
+-      matchedFreeHosting = providerName;
+-      break;
++    if (matchedFreeHosting) {
++        return {
++            candidate,
++            isOfficial: false,
++            isSubdomainAbuse: true,
++            isFreeHostingAbuse: true,
++            isCombosquat: true,
++            freeHostingProvider: matchedFreeHosting,
++            details: `Page represents ${candidate.candidateName} hosted on third-party cloud platform (${matchedFreeHosting}) rather than official domain.`
++        };
+     }
+-  }
+-  const isOfficial = candidate.canonicalDomains.some(
+-    (canonical) => cleanHostname === canonical || cleanHostname.endsWith("." + canonical) || registeredDomain === canonical
+-  );
+-  if (isOfficial) {
++    const isCombosquat = cleanHostname.includes(candidate.candidateName.toLowerCase().replace(/[^a-z0-9]/g, ''));
+     return {
+-      candidate,
+-      isOfficial: true,
+-      isSubdomainAbuse: false,
+-      isFreeHostingAbuse: false,
+-      isCombosquat: false,
+-      details: `Official verified ${candidate.candidateName} domain (${cleanHostname}).`
++        candidate,
++        isOfficial: false,
++        isSubdomainAbuse: cleanHostname.split('.').length > 2,
++        isFreeHostingAbuse: false,
++        isCombosquat,
++        details: `Page claims identity "${candidate.candidateName}" but is hosted on unrelated domain (${cleanHostname}).`
++    };
++}
++export function evaluateBrandImpersonation(hostname, pageTitle, visibleTokens = [], formMeta, socialMeta, customBrands = KNOWN_BRANDS) {
++    const candidate = inferBrandIdentity(hostname, pageTitle, visibleTokens, formMeta, socialMeta, customBrands);
++    if (!candidate) return null;
++    const evalResult = evaluateBrandDomainMismatch(hostname, candidate);
++    if (!evalResult) return null;
++    const matchedBrand = customBrands.find((b)=>b.name === candidate.candidateName) || {
++        id: candidate.candidateName.toLowerCase().replace(/[^a-z0-9]/g, ''),
++        name: candidate.candidateName,
++        canonicalDomains: candidate.canonicalDomains,
++        aliases: [
++            candidate.candidateName
++        ],
++        keywords: [
++            candidate.candidateName.toLowerCase()
++        ],
++        category: 'OTHER'
+     };
+-  }
+-  if (matchedFreeHosting) {
+     return {
+-      candidate,
+-      isOfficial: false,
+-      isSubdomainAbuse: true,
+-      isFreeHostingAbuse: true,
+-      isCombosquat: true,
+-      freeHostingProvider: matchedFreeHosting,
+-      details: `Page represents ${candidate.candidateName} hosted on third-party cloud platform (${matchedFreeHosting}) rather than official domain.`
++        brand: matchedBrand,
++        isOfficial: evalResult.isOfficial,
++        isSubdomainAbuse: evalResult.isSubdomainAbuse,
++        isFreeHostingAbuse: evalResult.isFreeHostingAbuse,
++        isCombosquat: evalResult.isCombosquat,
++        isHomoglyphOrTypo: false,
++        freeHostingProvider: evalResult.freeHostingProvider,
++        details: evalResult.details
+     };
+-  }
+-  const isCombosquat = cleanHostname.includes(candidate.candidateName.toLowerCase().replace(/[^a-z0-9]/g, ""));
+-  return {
+-    candidate,
+-    isOfficial: false,
+-    isSubdomainAbuse: cleanHostname.split(".").length > 2,
+-    isFreeHostingAbuse: false,
+-    isCombosquat,
+-    details: `Page claims identity "${candidate.candidateName}" but is hosted on unrelated domain (${cleanHostname}).`
+-  };
+ }
+-function evaluateBrandImpersonation(hostname, pageTitle, visibleTokens = [], formMeta, socialMeta, customBrands = KNOWN_BRANDS) {
+-  const candidate = inferBrandIdentity(hostname, pageTitle, visibleTokens, formMeta, socialMeta, customBrands);
+-  if (!candidate) return null;
+-  const evalResult = evaluateBrandDomainMismatch(hostname, candidate);
+-  if (!evalResult) return null;
+-  const matchedBrand = customBrands.find((b) => b.name === candidate.candidateName) || {
+-    id: candidate.candidateName.toLowerCase().replace(/[^a-z0-9]/g, ""),
+-    name: candidate.candidateName,
+-    canonicalDomains: candidate.canonicalDomains,
+-    aliases: [candidate.candidateName],
+-    keywords: [candidate.candidateName.toLowerCase()],
+-    category: "OTHER"
+-  };
+-  return {
+-    brand: matchedBrand,
+-    isOfficial: evalResult.isOfficial,
+-    isSubdomainAbuse: evalResult.isSubdomainAbuse,
+-    isFreeHostingAbuse: evalResult.isFreeHostingAbuse,
+-    isCombosquat: evalResult.isCombosquat,
+-    isHomoglyphOrTypo: false,
+-    freeHostingProvider: evalResult.freeHostingProvider,
+-    details: evalResult.details
+-  };
+-}
+-export {
+-  FREE_HOSTING_PROVIDERS,
+-  KNOWN_BRANDS,
+-  evaluateBrandDomainMismatch,
+-  evaluateBrandImpersonation,
+-  extractRegisteredDomain,
+-  inferBrandIdentity
+-};
+diff --git a/extension/engine/formAnalysis.js b/extension/engine/formAnalysis.js
+index fc1d976..372a9bc 100644
+--- a/extension/engine/formAnalysis.js
++++ b/extension/engine/formAnalysis.js
+@@ -1,185 +1,176 @@
+ import { isTrustedFederatedProvider } from '../config/trustedProviders.js';
+-function evaluateFormSecurity(pageUrl, formMeta) {
+-  const signals = [];
+-  if (!formMeta) return signals;
+-  let pageHost = "";
+-  try {
+-    const parsed = new URL(pageUrl.startsWith("http") ? pageUrl : "https://" + pageUrl);
+-    pageHost = parsed.hostname.toLowerCase();
+-  } catch {
+-    pageHost = pageUrl.toLowerCase();
+-  }
+-  if (formMeta.hasPasswordInput) {
+-    signals.push({
+-      id: "SIGNAL_PASSWORD_INPUT_PRESENT",
+-      category: "DOM_SECURITY",
+-      type: "CREDENTIAL_INPUT_FIELD",
+-      severity: "LOW",
+-      weight: 15,
+-      title: "Credential / Password Entry Field Present",
+-      description: "The webpage presents a password or credential entry field, indicating an active authentication surface.",
+-      confidence: 0.95
+-    });
+-  }
+-  if (formMeta.hasCreditCardInput || formMeta.hasSsnInput) {
+-    signals.push({
+-      id: "SIGNAL_FINANCIAL_INPUT_PRESENT",
+-      category: "DOM_SECURITY",
+-      type: "FINANCIAL_DATA_COLLECTION",
+-      severity: "MEDIUM",
+-      weight: 25,
+-      title: "Payment or Identity Data Input Field Present",
+-      description: "Page contains input fields explicitly requesting credit card numbers, CVVs, or Social Security numbers.",
+-      confidence: 0.9
+-    });
+-  }
+-  const insecureForms = (formMeta.suspiciousForms || []).filter((f) => f.isInsecureHttp);
+-  if (insecureForms.length > 0) {
+-    signals.push({
+-      id: "SIGNAL_INSECURE_FORM_ACTION",
+-      category: "DOM_SECURITY",
+-      type: "INSECURE_HTTP_FORM_SUBMISSION",
+-      severity: "HIGH",
+-      weight: 40,
+-      title: "Form Submits Credentials Over Insecure HTTP",
+-      description: "Form submission endpoint uses unencrypted HTTP protocol. Entered data can be intercepted by network eavesdroppers.",
+-      confidence: 0.95,
+-      evidence: { insecureFormsCount: insecureForms.length }
+-    });
+-  }
+-  const rogueCrossOriginForms = (formMeta.suspiciousForms || []).filter((f) => {
+-    if (!f.isCrossOrigin || !f.hasPasswordField) return false;
+-    let actionHost = "";
++export function evaluateFormSecurity(pageUrl, formMeta) {
++    const signals = [];
++    if (!formMeta) return signals;
++    let pageHost = '';
+     try {
+-      actionHost = new URL(f.action, pageUrl).hostname.toLowerCase();
+-    } catch {
+-      actionHost = "";
++        const parsed = new URL(pageUrl.startsWith('http') ? pageUrl : 'https://' + pageUrl);
++        pageHost = parsed.hostname.toLowerCase();
++    } catch  {
++        pageHost = pageUrl.toLowerCase();
+     }
+-    const { isTrusted } = isTrustedFederatedProvider(actionHost);
+-    return !isTrusted;
+-  });
+-  if (rogueCrossOriginForms.length > 0) {
+-    signals.push({
+-      id: "SIGNAL_CROSS_ORIGIN_CREDENTIAL_FORM",
+-      category: "DOM_SECURITY",
+-      type: "CROSS_ORIGIN_CREDENTIAL_HARVESTER",
+-      severity: "CRITICAL",
+-      weight: 60,
+-      title: "Cross-Origin Credential Form Action (Data Drop)",
+-      description: "The login form submits entered credentials to an unrelated external domain. This is a primary signature of credential harvesters.",
+-      confidence: 0.96,
+-      evidence: {
+-        pageHost,
+-        crossOriginActions: rogueCrossOriginForms.map((f) => f.action)
+-      }
+-    });
+-  }
+-  if (formMeta.hasHiddenCredentialFields) {
+-    signals.push({
+-      id: "SIGNAL_EXCESSIVE_HIDDEN_FIELDS",
+-      category: "DOM_SECURITY",
+-      type: "SUSPICIOUS_HIDDEN_FORM_FIELDS",
+-      severity: "LOW",
+-      weight: 12,
+-      title: "Excessive Hidden State Fields in Auth Form",
+-      description: "Authentication form includes numerous hidden fields, often utilized by phishing kits to pass stolen session and campaign tracker tags.",
+-      confidence: 0.7
+-    });
+-  }
+-  if (formMeta.has2FAInput) {
+-    signals.push({
+-      id: "SIGNAL_2FA_INTERCEPTION",
+-      category: "DOM_SECURITY",
+-      type: "2FA_OTP_INTERCEPTION_FIELD",
+-      severity: "MEDIUM",
+-      weight: 20,
+-      title: "Two-Factor / Passcode Request Field",
+-      description: "Page requests OTP authentication tokens, 2FA codes, or cryptocurrency seed phrases.",
+-      confidence: 0.85
++    if (formMeta.hasPasswordInput) {
++        signals.push({
++            id: 'SIGNAL_PASSWORD_INPUT_PRESENT',
++            category: 'DOM_SECURITY',
++            type: 'CREDENTIAL_INPUT_FIELD',
++            severity: 'LOW',
++            weight: 15,
++            title: 'Credential / Password Entry Field Present',
++            description: 'The webpage presents a password or credential entry field, indicating an active authentication surface.',
++            confidence: 0.95
++        });
++    }
++    if (formMeta.hasCreditCardInput || formMeta.hasSsnInput) {
++        signals.push({
++            id: 'SIGNAL_FINANCIAL_INPUT_PRESENT',
++            category: 'DOM_SECURITY',
++            type: 'FINANCIAL_DATA_COLLECTION',
++            severity: 'MEDIUM',
++            weight: 25,
++            title: 'Payment or Identity Data Input Field Present',
++            description: 'Page contains input fields explicitly requesting credit card numbers, CVVs, or Social Security numbers.',
++            confidence: 0.90
++        });
++    }
++    const insecureForms = (formMeta.suspiciousForms || []).filter((f)=>f.isInsecureHttp);
++    if (insecureForms.length > 0) {
++        signals.push({
++            id: 'SIGNAL_INSECURE_FORM_ACTION',
++            category: 'DOM_SECURITY',
++            type: 'INSECURE_HTTP_FORM_SUBMISSION',
++            severity: 'HIGH',
++            weight: 40,
++            title: 'Form Submits Credentials Over Insecure HTTP',
++            description: 'Form submission endpoint uses unencrypted HTTP protocol. Entered data can be intercepted by network eavesdroppers.',
++            confidence: 0.95,
++            evidence: {
++                insecureFormsCount: insecureForms.length
++            }
++        });
++    }
++    const rogueCrossOriginForms = (formMeta.suspiciousForms || []).filter((f)=>{
++        if (!f.isCrossOrigin || !f.hasPasswordField) return false;
++        let actionHost = '';
++        try {
++            actionHost = new URL(f.action, pageUrl).hostname.toLowerCase();
++        } catch  {
++            actionHost = '';
++        }
++        const { isTrusted } = isTrustedFederatedProvider(actionHost);
++        return !isTrusted;
+     });
+-  }
+-  return signals;
+-}
+-function extractDomMetadataFromDocument(doc, windowOrigin) {
+-  const passwordInputs = doc.querySelectorAll('input[type="password"]');
+-  const hasPasswordInput = passwordInputs.length > 0;
+-  const emailOrUserInputs = doc.querySelectorAll(
+-    'input[type="email"], input[name*="user" i], input[name*="login" i], input[id*="user" i], input[id*="login" i], input[autocomplete="username"], input[autocomplete="email"]'
+-  );
+-  const hasEmailOrUserInput = emailOrUserInputs.length > 0;
+-  const ccInputs = doc.querySelectorAll(
+-    'input[name*="card" i], input[name*="cc-" i], input[name*="cvv" i], input[id*="card" i], input[autocomplete*="cc-" i]'
+-  );
+-  const hasCreditCardInput = ccInputs.length > 0;
+-  const ssnInputs = doc.querySelectorAll(
+-    'input[name*="ssn" i], input[name*="social-security" i], input[id*="ssn" i]'
+-  );
+-  const hasSsnInput = ssnInputs.length > 0;
+-  const twoFaInputs = doc.querySelectorAll(
+-    'input[name*="otp" i], input[name*="2fa" i], input[name*="token" i], input[id*="otp" i], input[id*="2fa" i], input[name*="seed" i], input[name*="mnemonic" i]'
+-  );
+-  const has2FAInput = twoFaInputs.length > 0;
+-  const forms = Array.from(doc.querySelectorAll("form"));
+-  let hasHiddenCredentialFields = false;
+-  let currentHost = "";
+-  try {
+-    currentHost = new URL(windowOrigin).hostname.toLowerCase();
+-  } catch {
+-    currentHost = windowOrigin.toLowerCase();
+-  }
+-  const suspiciousForms = forms.map((form) => {
+-    const rawAction = form.getAttribute("action") || "";
+-    let isCrossOrigin = false;
+-    let isInsecureHttp = false;
+-    if (rawAction && !rawAction.startsWith("javascript:") && !rawAction.startsWith("#")) {
+-      try {
+-        const actionUrl = new URL(rawAction, windowOrigin);
+-        const actionHost = actionUrl.hostname.toLowerCase();
+-        isCrossOrigin = actionHost !== currentHost && !actionHost.endsWith("." + currentHost);
+-        isInsecureHttp = actionUrl.protocol === "http:";
+-      } catch {
+-      }
++    if (rogueCrossOriginForms.length > 0) {
++        signals.push({
++            id: 'SIGNAL_CROSS_ORIGIN_CREDENTIAL_FORM',
++            category: 'DOM_SECURITY',
++            type: 'CROSS_ORIGIN_CREDENTIAL_HARVESTER',
++            severity: 'CRITICAL',
++            weight: 60,
++            title: 'Cross-Origin Credential Form Action (Data Drop)',
++            description: 'The login form submits entered credentials to an unrelated external domain. This is a primary signature of credential harvesters.',
++            confidence: 0.96,
++            evidence: {
++                pageHost,
++                crossOriginActions: rogueCrossOriginForms.map((f)=>f.action)
++            }
++        });
++    }
++    if (formMeta.hasHiddenCredentialFields) {
++        signals.push({
++            id: 'SIGNAL_EXCESSIVE_HIDDEN_FIELDS',
++            category: 'DOM_SECURITY',
++            type: 'SUSPICIOUS_HIDDEN_FORM_FIELDS',
++            severity: 'LOW',
++            weight: 12,
++            title: 'Excessive Hidden State Fields in Auth Form',
++            description: 'Authentication form includes numerous hidden fields, often utilized by phishing kits to pass stolen session and campaign tracker tags.',
++            confidence: 0.70
++        });
+     }
+-    const formPasswordFields = form.querySelectorAll('input[type="password"]');
+-    const hiddenInputs = form.querySelectorAll('input[type="hidden"]');
+-    if (formPasswordFields.length > 0 && hiddenInputs.length > 5) {
+-      hasHiddenCredentialFields = true;
++    if (formMeta.has2FAInput) {
++        signals.push({
++            id: 'SIGNAL_2FA_INTERCEPTION',
++            category: 'DOM_SECURITY',
++            type: '2FA_OTP_INTERCEPTION_FIELD',
++            severity: 'MEDIUM',
++            weight: 20,
++            title: 'Two-Factor / Passcode Request Field',
++            description: 'Page requests OTP authentication tokens, 2FA codes, or cryptocurrency seed phrases.',
++            confidence: 0.85
++        });
++    }
++    return signals;
++}
++export function extractDomMetadataFromDocument(doc, windowOrigin) {
++    const passwordInputs = doc.querySelectorAll('input[type="password"]');
++    const hasPasswordInput = passwordInputs.length > 0;
++    const emailOrUserInputs = doc.querySelectorAll('input[type="email"], input[name*="user" i], input[name*="login" i], input[id*="user" i], input[id*="login" i], input[autocomplete="username"], input[autocomplete="email"]');
++    const hasEmailOrUserInput = emailOrUserInputs.length > 0;
++    const ccInputs = doc.querySelectorAll('input[name*="card" i], input[name*="cc-" i], input[name*="cvv" i], input[id*="card" i], input[autocomplete*="cc-" i]');
++    const hasCreditCardInput = ccInputs.length > 0;
++    const ssnInputs = doc.querySelectorAll('input[name*="ssn" i], input[name*="social-security" i], input[id*="ssn" i]');
++    const hasSsnInput = ssnInputs.length > 0;
++    const twoFaInputs = doc.querySelectorAll('input[name*="otp" i], input[name*="2fa" i], input[name*="token" i], input[id*="otp" i], input[id*="2fa" i], input[name*="seed" i], input[name*="mnemonic" i]');
++    const has2FAInput = twoFaInputs.length > 0;
++    const forms = Array.from(doc.querySelectorAll('form'));
++    let hasHiddenCredentialFields = false;
++    let currentHost = '';
++    try {
++        currentHost = new URL(windowOrigin).hostname.toLowerCase();
++    } catch  {
++        currentHost = windowOrigin.toLowerCase();
+     }
++    const suspiciousForms = forms.map((form)=>{
++        const rawAction = form.getAttribute('action') || '';
++        let isCrossOrigin = false;
++        let isInsecureHttp = false;
++        if (rawAction && !rawAction.startsWith('javascript:') && !rawAction.startsWith('#')) {
++            try {
++                const actionUrl = new URL(rawAction, windowOrigin);
++                const actionHost = actionUrl.hostname.toLowerCase();
++                isCrossOrigin = actionHost !== currentHost && !actionHost.endsWith('.' + currentHost);
++                isInsecureHttp = actionUrl.protocol === 'http:';
++            } catch  {}
++        }
++        const formPasswordFields = form.querySelectorAll('input[type="password"]');
++        const hiddenInputs = form.querySelectorAll('input[type="hidden"]');
++        if (formPasswordFields.length > 0 && hiddenInputs.length > 5) {
++            hasHiddenCredentialFields = true;
++        }
++        return {
++            action: rawAction,
++            method: (form.getAttribute('method') || 'GET').toUpperCase(),
++            isCrossOrigin,
++            isInsecureHttp,
++            hasCreditCardField: !!form.querySelector('input[autocomplete^="cc-"],input[name*="card" i]'),
++          has2FAField: !!form.querySelector('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="2fa" i]'),
++            identityLabels: Array.from(form.querySelectorAll('legend,h1,h2,h3,button,label')).slice(0, 12).filter((el)=>!el.closest('[contenteditable]')).map((el)=>Array.from(el.childNodes).filter((n)=>n.nodeType === 3).map((n)=>n.textContent).join(' ').trim().slice(0, 100)).filter(Boolean),
++            hasPasswordField: formPasswordFields.length > 0,
++            inputCount: form.querySelectorAll('input, select, textarea').length,
++            hiddenInputsCount: hiddenInputs.length
++        };
++    });
++    const externalScripts = [];
++    try {
++        const scriptTags = Array.from(doc.querySelectorAll('script[src]'));
++        for (const s of scriptTags.slice(0, 10)){
++            const src = s.getAttribute('src');
++            if (src && src.startsWith('http')) {
++                externalScripts.push(src);
++            }
++        }
++    } catch  {}
+     return {
+-      action: rawAction,
+-      method: (form.getAttribute("method") || "GET").toUpperCase(),
+-      isCrossOrigin,
+-      isInsecureHttp,
+-      hasPasswordField: formPasswordFields.length > 0,
+-      inputCount: form.querySelectorAll("input, select, textarea").length,
+-      hiddenInputsCount: hiddenInputs.length
++        hasPasswordInput,
++        hasCreditCardInput,
++        hasSsnInput,
++        hasEmailOrUserInput,
++        has2FAInput,
++        formsCount: forms.length,
++        suspiciousForms,
++        hasHiddenCredentialFields,
++        hasExternalScriptSources: externalScripts,
++        pageTitle: doc.title
+     };
+-  });
+-  const externalScripts = [];
+-  try {
+-    const scriptTags = Array.from(doc.querySelectorAll("script[src]"));
+-    for (const s of scriptTags.slice(0, 10)) {
+-      const src = s.getAttribute("src");
+-      if (src && src.startsWith("http")) {
+-        externalScripts.push(src);
+-      }
+-    }
+-  } catch {
+-  }
+-  return {
+-    hasPasswordInput,
+-    hasCreditCardInput,
+-    hasSsnInput,
+-    hasEmailOrUserInput,
+-    has2FAInput,
+-    formsCount: forms.length,
+-    suspiciousForms,
+-    hasHiddenCredentialFields,
+-    hasExternalScriptSources: externalScripts,
+-    pageTitle: doc.title
+-  };
+ }
+-export {
+-  evaluateFormSecurity,
+-  extractDomMetadataFromDocument
+-};
+diff --git a/extension/engine/riskScoring.js b/extension/engine/riskScoring.js
+index 90fede3..3bae6df 100644
+--- a/extension/engine/riskScoring.js
++++ b/extension/engine/riskScoring.js
+@@ -203,7 +203,7 @@ function analyzePageSecurity(rawUrl, formMetadata, redirectData, customSettings,
+   }
+   let baseScore = allSignals.reduce((sum, s) => sum + s.weight, 0);
+   const isOfficialBrand = typosquatResult.isLegitimateBrand || brandEval && brandEval.isOfficial;
+-  if (isOfficialBrand) {
++  if (isOfficialBrand && (!brandEval || brandEval.isOfficial)) {
+     baseScore = Math.round(baseScore * LEGITIMATE_BRAND_DAMPENER_FACTOR);
+   }
+   const multiplier = SENSITIVITY_MULTIPLIERS[settings.detectionSensitivity] || 1;
+diff --git a/extension/engine/typosquatting.js b/extension/engine/typosquatting.js
+index ec07717..bcb7154 100644
+--- a/extension/engine/typosquatting.js
++++ b/extension/engine/typosquatting.js
+@@ -1,3 +1,4 @@
++import { sharedHost } from './brandIdentity.js';
+ import { HOMOGLYPH_MAP } from '../config/rules.js';
+ import { DEFAULT_PROTECTED_BRANDS } from '../config/brands.js';
+ function normalizeVisualSubstitutions(text) {
+@@ -52,13 +53,14 @@ function analyzeTyposquatting(hostname, customBrands) {
+   const signals = [];
+   const brands = customBrands && customBrands.length > 0 ? customBrands : DEFAULT_PROTECTED_BRANDS;
+   const cleanHost = hostname.toLowerCase();
++  const provider = sharedHost(cleanHost);
+   const hostParts = cleanHost.split(".").filter(Boolean);
+   if (hostParts.length === 0) {
+     return { signals, isLegitimateBrand: false };
+   }
+   for (const brand of brands) {
+     for (const canonical of brand.canonicalDomains) {
+-      if (cleanHost === canonical || cleanHost.endsWith("." + canonical)) {
++      if (!provider && (cleanHost === canonical || cleanHost.endsWith("." + canonical))) {
+         return {
+           signals: [],
+           targetBrand: brand,
+@@ -68,7 +70,7 @@ function analyzeTyposquatting(hostname, customBrands) {
+     }
+   }
+   let matchedBrand;
+-  const candidateSegments = hostParts.slice(0, -1);
++  const candidateSegments = provider ? hostParts.slice(0, -provider.split(".").length) : hostParts.slice(0, -1);
+   const normalizedCandidateSegments = candidateSegments.map((s) => normalizeVisualSubstitutions(s));
+   for (const brand of brands) {
+     const brandName = brand.id.toLowerCase();
+diff --git a/extension/events/pageEvents.js b/extension/events/pageEvents.js
+index e121785..ec7c252 100644
+--- a/extension/events/pageEvents.js
++++ b/extension/events/pageEvents.js
+@@ -1,76 +1,76 @@
+ import { inferBrandIdentity, evaluateBrandDomainMismatch, extractRegisteredDomain } from '../engine/brandIdentity.js';
+-function createPageBrandingEvent(input) {
+-  let hostname = "";
+-  let origin = "";
+-  try {
+-    const parsed = new URL(input.url.startsWith("http") ? input.url : "https://" + input.url);
+-    hostname = parsed.hostname.toLowerCase();
+-    origin = parsed.origin;
+-  } catch {
+-    hostname = input.url.toLowerCase();
+-    origin = input.url;
+-  }
+-  const registeredDomain = extractRegisteredDomain(hostname);
+-  const visibleTokens = [...input.headings || [], ...input.metaTokens || []];
+-  const candidate = inferBrandIdentity(hostname, input.title, visibleTokens);
+-  if (!candidate) {
+-    return null;
+-  }
+-  const mismatchEval = evaluateBrandDomainMismatch(hostname, candidate);
+-  if (!mismatchEval) {
+-    return null;
+-  }
+-  const isFreeHosting = mismatchEval.isFreeHostingAbuse;
+-  const isOfficial = mismatchEval.isOfficial;
+-  let severity = "SAFE";
+-  let eventType = "BRAND_IDENTITY_DETECTED";
+-  let title = `Verified ${candidate.candidateName} Domain`;
+-  let description = `Official authentic service for ${candidate.candidateName}.`;
+-  if (!isOfficial) {
+-    if (isFreeHosting) {
+-      severity = "CRITICAL";
+-      eventType = "FREE_HOSTING_DETECTED";
+-      title = `${candidate.candidateName} Impersonation on Free Hosting`;
+-      description = `Website displays ${candidate.candidateName} branding on third-party cloud platform (${mismatchEval.freeHostingProvider}) rather than official ${candidate.canonicalDomains[0]}.`;
+-    } else {
+-      severity = "HIGH";
+-      eventType = "DOMAIN_MISMATCH_DETECTED";
+-      title = `Brand Domain Mismatch (${candidate.candidateName})`;
+-      description = `Website claims to represent ${candidate.candidateName}, but hostname (${hostname}) does not match official domain (${candidate.canonicalDomains[0]}).`;
++export function createPageBrandingEvent(input) {
++    let hostname = '';
++    let origin = '';
++    try {
++        const parsed = new URL(input.url.startsWith('http') ? input.url : 'https://' + input.url);
++        hostname = parsed.hostname.toLowerCase();
++        origin = parsed.origin;
++    } catch  {
++        hostname = input.url.toLowerCase();
++        origin = input.url;
+     }
+-  }
+-  return {
+-    id: `brand_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+-    timestamp: Date.now(),
+-    tabId: input.tabId,
+-    pageUrl: input.url,
+-    pageOrigin: origin,
+-    type: eventType,
+-    severity,
+-    title,
+-    description,
+-    claimedBrandName: candidate.candidateName,
+-    canonicalDomains: candidate.canonicalDomains,
+-    currentHostname: hostname,
+-    currentRegisteredDomain: registeredDomain,
+-    isFreeHostingProvider: isFreeHosting,
+-    freeHostingProviderName: mismatchEval.freeHostingProvider,
+-    isOfficialDomain: isOfficial,
+-    brandTokensFound: candidate.evidence,
+-    pageTitle: input.title,
+-    evidence: {
+-      candidateName: candidate.candidateName,
+-      canonicalDomains: candidate.canonicalDomains,
+-      hostname,
+-      registeredDomain,
+-      isOfficial,
+-      isFreeHosting,
+-      freeHostingProvider: mismatchEval.freeHostingProvider,
+-      confidence: candidate.confidence,
+-      evidenceList: candidate.evidence
++    const registeredDomain = extractRegisteredDomain(hostname);
++    const visibleTokens = [
++        ...input.headings || [],
++        ...input.metaTokens || []
++    ];
++    const candidate = inferBrandIdentity(hostname, input.title, visibleTokens, input.formMetadata);
++    if (!candidate) {
++        return null;
+     }
+-  };
++    const mismatchEval = evaluateBrandDomainMismatch(hostname, candidate);
++    if (!mismatchEval) {
++        return null;
++    }
++    const isFreeHosting = mismatchEval.isFreeHostingAbuse;
++    const isOfficial = mismatchEval.isOfficial;
++    let severity = 'SAFE';
++    let eventType = 'BRAND_IDENTITY_DETECTED';
++    let title = `Verified ${candidate.candidateName} Domain`;
++    let description = `Official authentic service for ${candidate.candidateName}.`;
++    if (!isOfficial) {
++        if (isFreeHosting) {
++            severity = 'CRITICAL';
++            eventType = 'FREE_HOSTING_DETECTED';
++            title = `${candidate.candidateName} Impersonation on Free Hosting`;
++            description = `Website displays ${candidate.candidateName} branding on third-party cloud platform (${mismatchEval.freeHostingProvider}) rather than official ${candidate.canonicalDomains[0]}.`;
++        } else {
++            severity = 'HIGH';
++            eventType = 'DOMAIN_MISMATCH_DETECTED';
++            title = `Brand Domain Mismatch (${candidate.candidateName})`;
++            description = `Website claims to represent ${candidate.candidateName}, but hostname (${hostname}) does not match official domain (${candidate.canonicalDomains[0]}).`;
++        }
++    }
++    return {
++        id: `brand_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
++        timestamp: Date.now(),
++        tabId: input.tabId,
++        pageUrl: input.url,
++        pageOrigin: origin,
++        type: eventType,
++        severity,
++        title,
++        description,
++        claimedBrandName: candidate.candidateName,
++        canonicalDomains: candidate.canonicalDomains,
++        currentHostname: hostname,
++        currentRegisteredDomain: registeredDomain,
++        isFreeHostingProvider: isFreeHosting,
++        freeHostingProviderName: mismatchEval.freeHostingProvider,
++        isOfficialDomain: isOfficial,
++        brandTokensFound: candidate.evidence,
++        pageTitle: input.title,
++        evidence: {
++            candidateName: candidate.candidateName,
++            canonicalDomains: candidate.canonicalDomains,
++            hostname,
++            registeredDomain,
++            isOfficial,
++            isFreeHosting,
++            freeHostingProvider: mismatchEval.freeHostingProvider,
++            confidence: candidate.confidence,
++            evidenceList: candidate.evidence
++        }
++    };
+ }
+-export {
+-  createPageBrandingEvent
+-};
+diff --git a/src/core/config/brands.ts b/src/core/config/brands.ts
+index 474c32e..60dbb01 100644
+--- a/src/core/config/brands.ts
++++ b/src/core/config/brands.ts
+@@ -1,6 +1,7 @@
+ import { ProtectedBrand } from '../types';
+ 
+ export const DEFAULT_PROTECTED_BRANDS: ProtectedBrand[] = [
++  { id: 'twitter', name: 'X / Twitter', canonicalDomains: ['x.com', 'twitter.com'], keywords: ['twitter'], category: 'SOCIAL' },
+   {
+     id: 'vinted',
+     name: 'Vinted',
+@@ -127,7 +128,7 @@ export const DEFAULT_PROTECTED_BRANDS: ProtectedBrand[] = [
+   {
+     id: 'github',
+     name: 'GitHub',
+-    canonicalDomains: ['github.com', 'github.io', 'githubusercontent.com', 'github.blog'],
++    canonicalDomains: ['github.com', 'githubusercontent.com', 'github.blog'],
+     keywords: ['github', 'g1thub', 'github-login', 'github-auth'],
+     category: 'TECH'
+   },
+diff --git a/src/core/engine/brandIdentity.ts b/src/core/engine/brandIdentity.ts
+index 38bdb93..f77f66d 100644
+--- a/src/core/engine/brandIdentity.ts
++++ b/src/core/engine/brandIdentity.ts
+@@ -29,6 +29,8 @@ export interface BrandIdentity {
+ }
+ 
+ export interface BrandIdentityCandidate {
++  domainOwnerId?: string;
++  mentionedBrandIds?: string[];
+   candidateName: string;
+   confidence: number; // 0.0 to 1.0
+   evidence: string[];
+@@ -39,6 +41,7 @@ export interface BrandIdentityCandidate {
+ }
+ 
+ export const KNOWN_BRANDS: BrandIdentity[] = [
++  { id: 'twitter', name: 'X / Twitter', canonicalDomains: ['x.com', 'twitter.com'], keywords: ['twitter'], category: 'SOCIAL', aliases: ['twitter', 'x'] },
+   {
+     id: 'vinted',
+     name: 'Vinted',
+@@ -165,7 +168,7 @@ export const KNOWN_BRANDS: BrandIdentity[] = [
+   {
+     id: 'github',
+     name: 'GitHub',
+-    canonicalDomains: ['github.com', 'github.io', 'githubusercontent.com', 'github.blog'],
++    canonicalDomains: ['github.com', 'githubusercontent.com', 'github.blog'],
+     aliases: ['github', 'github inc'],
+     keywords: ['github', 'g1thub', 'github sign in'],
+     category: 'TECH'
+@@ -234,6 +237,12 @@ export const FREE_HOSTING_PROVIDERS: Record<string, string> = {
+ /**
+  * Robust Registered Domain Extraction (eTLD+1 approximation)
+  */
++export function sharedHost(hostname: string) {
++  return Object.keys(FREE_HOSTING_PROVIDERS).find(provider =>
++    hostname === provider || hostname.endsWith('.' + provider)
++  );
++}
++
+ export function extractRegisteredDomain(hostname: string): string {
+   const clean = hostname.toLowerCase().trim();
+   const parts = clean.split('.');
+@@ -274,160 +283,31 @@ export function inferBrandIdentity(
+   socialMeta?: SocialEngineeringMetadata | null,
+   customBrands: BrandIdentity[] = KNOWN_BRANDS
+ ): BrandIdentityCandidate | null {
+-  const cleanHostname = hostname.toLowerCase().trim();
+-  const registeredDomain = extractRegisteredDomain(cleanHostname);
+-
+-  // 1. Check Known Brand Engine (Layer A)
+-  for (const brand of customBrands) {
+-    // Check if canonical domain
+-    const isCanonical = brand.canonicalDomains.some(d => cleanHostname === d || cleanHostname.endsWith('.' + d));
+-    if (isCanonical) {
+-      return {
+-        candidateName: brand.name,
+-        confidence: 0.99,
+-        evidence: [`Matches verified canonical domain ${cleanHostname}`],
+-        source: 'KNOWN_REGISTRY',
+-        isKnownBrand: true,
+-        knownBrandId: brand.id,
+-        canonicalDomains: brand.canonicalDomains
+-      };
+-    }
+-
+-    // Check if brand tokens appear in hostname (subdomain or combosquat)
+-    const brandTokens = [brand.id, ...brand.keywords.map(k => k.replace(/\s+/g, ''))];
+-    let hostMatch = false;
+-    let matchingToken = '';
+-    for (const token of brandTokens) {
+-      if (token.length >= 3 && cleanHostname.includes(token)) {
+-        hostMatch = true;
+-        matchingToken = token;
+-        break;
+-      }
+-    }
+-
+-    // Check if brand appears in title or visible headings
+-    let contextMatch = false;
+-    if (pageTitle && (pageTitle.toLowerCase().includes(brand.name.toLowerCase()) || brand.keywords.some(k => pageTitle.toLowerCase().includes(k)))) {
+-      contextMatch = true;
+-    }
+-    if (visibleTokens.some(t => t.toLowerCase() === brand.name.toLowerCase() || brand.keywords.includes(t.toLowerCase()))) {
+-      contextMatch = true;
+-    }
+-
+-    if (hostMatch || contextMatch) {
+-      const evidence = [];
+-      if (hostMatch) evidence.push(`Hostname contains brand token "${matchingToken}"`);
+-      if (contextMatch) evidence.push(`Page title or heading references brand "${brand.name}"`);
+-
+-      return {
+-        candidateName: brand.name,
+-        confidence: hostMatch && contextMatch ? 0.95 : 0.85,
+-        evidence,
+-        source: 'KNOWN_REGISTRY',
+-        isKnownBrand: true,
+-        knownBrandId: brand.id,
+-        canonicalDomains: brand.canonicalDomains
+-      };
+-    }
+-  }
+-
+-  // 2. Generic Unknown Brand Inference (Layer B)
+-  // Extracts identity candidate from title, headings, and subdomain prefixes on free hosting
+-  const genericCandidates: Array<{ name: string; confidence: number; evidence: string[]; source: BrandIdentityCandidate['source'] }> = [];
+-
+-  // Source B1: Title extraction (e.g. "Jumia Nigeria - Login", "Acme Portal - Sign In", "Global Express Portal")
+-  if (pageTitle && pageTitle.trim().length > 2) {
+-    const titleClean = pageTitle.trim();
+-    // Common splitters: " | ", " - ", " – ", " — ", " : "
+-    const titleParts = titleClean.split(/\s*[-–—|:]\s*/).filter(Boolean);
+-    if (titleParts.length > 0) {
+-      const candidateTitleName = titleParts[0].trim();
+-      const isGenericNoise = /^(login|sign\s*in|welcome|home|index|untitled|page|loading|portal)$/i.test(candidateTitleName);
+-      if (!isGenericNoise && candidateTitleName.length >= 3 && candidateTitleName.length <= 35) {
+-        genericCandidates.push({
+-          name: candidateTitleName,
+-          confidence: 0.70,
+-          evidence: [`Document title prominently presents entity "${candidateTitleName}"`],
+-          source: 'DOCUMENT_TITLE'
+-        });
+-      }
+-    }
+-  }
+-
+-  // Source B2: Subdomain token on Free Hosting (e.g. "jumia.vercel.app", "fintech-portal.pages.dev")
+-  let isFreeHosting = false;
+-  const hasFormsOrUrgency = !!(
+-    formMeta?.hasPasswordInput ||
+-    formMeta?.hasCreditCardInput ||
+-    formMeta?.has2FAInput ||
+-    socialMeta?.hasUrgencyLanguage ||
+-    socialMeta?.hasCredentialVerificationPrompt
+-  );
+-
+-  for (const providerDomain of Object.keys(FREE_HOSTING_PROVIDERS)) {
+-    if (cleanHostname.endsWith(providerDomain)) {
+-      isFreeHosting = true;
+-      const subdomain = cleanHostname.replace('.' + providerDomain, '').replace(/\./g, '-');
+-      // Strip noise suffixes like -login, -security, -verify, -portal, -auth
+-      const cleanedToken = subdomain
+-        .replace(/-(login|verify|security|portal|auth|update|support|checkout|payment|app)$/i, '')
+-        .replace(/^(secure|my|login|auth|portal)-/i, '');
+-      
+-      const hasSecurityKeywords = /-(login|verify|security|portal|auth|update|support|checkout|payment)$/i.test(subdomain) ||
+-        /^(secure|login|auth|portal)-/i.test(subdomain);
+-
+-      // Only infer unknown brand from free hosting subdomain if accompanied by security keywords, forms, or urgency
+-      if (cleanedToken.length >= 3 && !/^(www|app|test|dev|demo|stage|prod|api)$/i.test(cleanedToken)) {
+-        if (hasSecurityKeywords || hasFormsOrUrgency) {
+-          const formattedName = cleanedToken.charAt(0).toUpperCase() + cleanedToken.slice(1);
+-          genericCandidates.push({
+-            name: formattedName,
+-            confidence: 0.75,
+-            evidence: [`Free hosting subdomain "${subdomain}" claims identity "${formattedName}"`],
+-            source: 'HOSTNAME_TOKEN'
+-          });
+-        }
+-      }
+-      break;
+-    }
+-  }
+-
+-  // Source B3: Visible headings (e.g. "Sign in to Jumia", "Welcome to Acme Bank")
+-  for (const token of visibleTokens) {
+-    const authMatch = token.match(/(?:sign\s*in\s*to|log\s*in\s*to|welcome\s*to|verify\s*your)\s+([A-Za-z0-9\s]{3,25})/i);
+-    if (authMatch && authMatch[1]) {
+-      const extractedBrand = authMatch[1].trim();
+-      if (!/^(account|portal|website|page|service|system)$/i.test(extractedBrand)) {
+-        genericCandidates.push({
+-          name: extractedBrand,
+-          confidence: 0.80,
+-          evidence: [`Authentication heading declares "${token}"`],
+-          source: 'HEADINGS'
+-        });
+-      }
+-    }
+-  }
+-
+-  if (genericCandidates.length === 0) {
+-    return null;
+-  }
+-
+-  // Pick candidate with highest confidence
+-  genericCandidates.sort((a, b) => b.confidence - a.confidence);
+-  const best = genericCandidates[0];
+-
+-  // Try to formulate plausible canonical domain for inferred brand
+-  const inferredClean = best.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+-  const inferredCanonical = `${inferredClean}.com`;
+-
+-  return {
+-    candidateName: best.name,
+-    confidence: best.confidence,
+-    evidence: best.evidence,
+-    source: best.source,
+-    isKnownBrand: false,
+-    canonicalDomains: [inferredCanonical]
+-  };
++  const host = hostname.trim().toLowerCase().replace(/\.$/, '');
++  const provider = sharedHost(host);
++  const tenant = provider ? host.slice(0, -(provider.length + 1)) : host;
++  const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, ' ');
++  const title = norm(pageTitle || '');
++  const headings = visibleTokens.map(norm);
++  const labels = (formMeta?.suspiciousForms || []).filter(f => f.hasPasswordField || f.has2FAField).flatMap(f => f.identityLabels || []).map(norm);
++  const rows = customBrands.map(brand => {
++    const names = [brand.id, ...brand.aliases, brand.name].map(norm);
++    const login = (t: string, n: string) => ['sign in to ', 'log in to ', 'login to ', 'تسجيل الدخول إلى '].some(p => t === p+n) || [' login', ' sign in', ' account login'].some(p => t === n+p);
++    const formClaim = labels.some(t => names.some(n => login(t,n) || (n.length > 1 && t === n)));
++    const titleClaim = names.some(n => login(title,n) || (n.length > 1 && title === n));
++    const hostMatch = [brand.id,...brand.keywords].some(k => k.length >= 3 && tenant.includes(k.toLowerCase().replace(/\s+/g,'')));
++    const official = !provider && brand.canonicalDomains.some(d => host === d || host.endsWith('.'+d));
++    const mentioned = [title,...headings].some(t => names.some(n => t === n || (n.length > 1 && t.split(/[^\p{L}\p{N}]+/u).includes(n))));
++    return {brand, formClaim, titleClaim, hostMatch, official, mentioned};
++  }).sort((a,b) => a.brand.id.localeCompare(b.brand.id));
++  const owner = rows.find(r => r.official);
++  const row = rows.find(r => r.formClaim && r !== owner) || owner || rows.find(r => r.formClaim) || rows.find(r => r.titleClaim) || rows.find(r => r.hostMatch);
++  if (!row) return null; // Unknown identity: no verified domain to compare against.
++  return { candidateName: row.brand.name, confidence: row.official ? 0.99 : 0.85,
++    source: 'KNOWN_REGISTRY', isKnownBrand: true, knownBrandId: row.brand.id,
++    domainOwnerId: owner?.brand.id, mentionedBrandIds: rows.filter(r => r.mentioned).map(r => r.brand.id),
++    canonicalDomains: row.brand.canonicalDomains,
++    evidence: [row.official ? 'Official domain' : row.formClaim ? 'Brand claim inside credential form' : row.titleClaim ? 'Page title claims this identity' : 'Brand token in hostname'] };
+ }
+ 
+ /**
+@@ -445,7 +325,7 @@ export function evaluateBrandDomainMismatch(
+   // Check if current hostname is on a known free hosting provider
+   let matchedFreeHosting: string | undefined;
+   for (const [providerDomain, providerName] of Object.entries(FREE_HOSTING_PROVIDERS)) {
+-    if (cleanHostname.endsWith(providerDomain) || cleanHostname === providerDomain) {
++    if (sharedHost(cleanHostname) === providerDomain) {
+       matchedFreeHosting = providerName;
+       break;
+     }
+@@ -456,7 +336,7 @@ export function evaluateBrandDomainMismatch(
+     cleanHostname === canonical || cleanHostname.endsWith('.' + canonical) || registeredDomain === canonical
+   );
+ 
+-  if (isOfficial) {
++  if (!matchedFreeHosting && isOfficial) {
+     return {
+       candidate,
+       isOfficial: true,
+diff --git a/src/core/engine/formAnalysis.ts b/src/core/engine/formAnalysis.ts
+index 44be134..e43cfb1 100644
+--- a/src/core/engine/formAnalysis.ts
++++ b/src/core/engine/formAnalysis.ts
+@@ -190,7 +190,10 @@ export function extractDomMetadataFromDocument(doc: Document, windowOrigin: stri
+       method: (form.getAttribute('method') || 'GET').toUpperCase(),
+       isCrossOrigin,
+       isInsecureHttp,
+-      hasPasswordField: formPasswordFields.length > 0,
++      hasCreditCardField: !!form.querySelector('input[autocomplete^="cc-"],input[name*="card" i]'),
++          has2FAField: !!form.querySelector('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="2fa" i]'),
++          identityLabels: Array.from(form.querySelectorAll('legend,h1,h2,h3,button,label')).slice(0,12).filter(el => !el.closest('[contenteditable]')).map(el => Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').trim().slice(0,100)).filter(Boolean),
++          hasPasswordField: formPasswordFields.length > 0,
+       inputCount: form.querySelectorAll('input, select, textarea').length,
+       hiddenInputsCount: hiddenInputs.length
+     };
+diff --git a/src/core/engine/riskScoring.ts b/src/core/engine/riskScoring.ts
+index e61685a..bd53f8b 100644
+--- a/src/core/engine/riskScoring.ts
++++ b/src/core/engine/riskScoring.ts
+@@ -282,7 +282,7 @@ export function analyzePageSecurity(
+ 
+   // If this is a canonical, verified legitimate brand domain, dampen any false generic signals
+   const isOfficialBrand = typosquatResult.isLegitimateBrand || (brandEval && brandEval.isOfficial);
+-  if (isOfficialBrand) {
++  if (isOfficialBrand && (!brandEval || brandEval.isOfficial)) {
+     baseScore = Math.round(baseScore * LEGITIMATE_BRAND_DAMPENER_FACTOR);
+   }
+ 
+diff --git a/src/core/engine/typosquatting.ts b/src/core/engine/typosquatting.ts
+index 3aa3a15..cc6e5b8 100644
+--- a/src/core/engine/typosquatting.ts
++++ b/src/core/engine/typosquatting.ts
+@@ -1,3 +1,4 @@
++import { sharedHost } from './brandIdentity';
+ import { DetectionSignal, ProtectedBrand } from '../types';
+ import { HOMOGLYPH_MAP } from '../config/rules';
+ import { DEFAULT_PROTECTED_BRANDS } from '../config/brands';
+@@ -82,6 +83,7 @@ export function analyzeTyposquatting(
+   const signals: DetectionSignal[] = [];
+   const brands = customBrands && customBrands.length > 0 ? customBrands : DEFAULT_PROTECTED_BRANDS;
+   const cleanHost = hostname.toLowerCase();
++  const provider = sharedHost(cleanHost);
+ 
+   // Extract core domain segments (excluding common ccTLDs)
+   const hostParts = cleanHost.split('.').filter(Boolean);
+@@ -92,7 +94,7 @@ export function analyzeTyposquatting(
+   // 1. Check if domain is an official canonical domain for any protected brand
+   for (const brand of brands) {
+     for (const canonical of brand.canonicalDomains) {
+-      if (cleanHost === canonical || cleanHost.endsWith('.' + canonical)) {
++      if (!provider && (cleanHost === canonical || cleanHost.endsWith('.' + canonical))) {
+         return {
+           signals: [],
+           targetBrand: brand,
+@@ -105,7 +107,7 @@ export function analyzeTyposquatting(
+   let matchedBrand: ProtectedBrand | undefined;
+ 
+   // 2. Evaluate each hostname segment (excluding TLD)
+-  const candidateSegments = hostParts.slice(0, -1);
++  const candidateSegments = provider ? hostParts.slice(0, -provider.split(".").length) : hostParts.slice(0, -1);
+   const normalizedCandidateSegments = candidateSegments.map(s => normalizeVisualSubstitutions(s));
+ 
+   for (const brand of brands) {
+diff --git a/src/core/events/pageEvents.ts b/src/core/events/pageEvents.ts
+index aa58d78..a9528a9 100644
+--- a/src/core/events/pageEvents.ts
++++ b/src/core/events/pageEvents.ts
+@@ -1,3 +1,4 @@
++import type { FormAnalysisMetadata } from '../types';
+ /**
+  * PhishGuard Page & Branding Event Analyzer
+  * 
+@@ -13,6 +14,7 @@ export interface PageMetadataInput {
+   url: string;
+   title?: string;
+   headings?: string[];
++  formMetadata?: FormAnalysisMetadata;
+   metaTokens?: string[];
+ }
+ 
+@@ -32,7 +34,7 @@ export function createPageBrandingEvent(input: PageMetadataInput): PageBrandingE
+   const registeredDomain = extractRegisteredDomain(hostname);
+   const visibleTokens = [...(input.headings || []), ...(input.metaTokens || [])];
+   
+-  const candidate = inferBrandIdentity(hostname, input.title, visibleTokens);
++  const candidate = inferBrandIdentity(hostname, input.title, visibleTokens, input.formMetadata);
+   if (!candidate) {
+     return null;
+   }
+diff --git a/src/core/tests/testSuite.ts b/src/core/tests/testSuite.ts
+index 718bcd5..f9f3986 100644
+--- a/src/core/tests/testSuite.ts
++++ b/src/core/tests/testSuite.ts
+@@ -470,9 +470,10 @@ export const SECURITY_TEST_CASES: SecurityTestCase[] = [
+       hasHiddenCredentialFields: false,
+       pageTitle: 'Checkout - Complete Your Order'
+     },
+-    expectedVerdict: 'HIGH_RISK',
+-    expectedMinScore: 60,
+-    expectedMaxScore: 100,
++    // Generic checkout: preserve payment evidence without inventing an impersonated brand.
++    expectedVerdict: 'LOW_RISK',
++    expectedMinScore: 20,
++    expectedMaxScore: 39,
+     expectedSignals: ['FINANCIAL_DATA_COLLECTION']
+   },
+ 
+diff --git a/src/core/types.ts b/src/core/types.ts
+index 15d6db6..bdc9d26 100644
+--- a/src/core/types.ts
++++ b/src/core/types.ts
+@@ -57,6 +57,9 @@ export interface FormAnalysisMetadata {
+     method: string;
+     isCrossOrigin: boolean;
+     isInsecureHttp: boolean;
++    identityLabels?: string[];
++    hasCreditCardField?: boolean;
++    has2FAField?: boolean;
+     hasPasswordField: boolean;
+     inputCount: number;
+     hiddenInputsCount: number;
