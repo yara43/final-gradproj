@@ -10,6 +10,7 @@
     "build:extension": "tsx scripts/buildExtension.ts && node scripts/generateIcons.js",
     "package:extension": "tsx scripts/buildExtension.ts && node scripts/generateIcons.js && tsx scripts/packageExtension.ts",
     "test": "tsx -e \"import { runSecurityTestSuite } from './src/core/tests/testSuite'; runSecurityTestSuite().then(r => { console.log('Total:', r.total, 'Passed:', r.passed, 'PassRate:', r.passRate + '%'); if(r.failed > 0) process.exit(1); });\"",
+    "test:domain": "node scripts/test-domain-parser.mjs",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"
@@ -26,6 +27,7 @@
     "motion": "^12.23.24",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
+    "tldts": "7.5.5",
     "vite": "^6.2.3"
   },
   "devDependencies": {

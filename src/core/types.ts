@@ -89,6 +89,7 @@ export interface UrlFeatures {
   isIpAddress: boolean;
   isPunycode: boolean;
   decodedPunycode?: string;
+  hasNonAsciiInHost: boolean;
   subdomainCount: number;
   domainParts: string[];
   tld: string;

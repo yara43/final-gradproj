@@ -1,5 +1,7 @@
 import { UrlFeatures, DetectionSignal } from '../types';
 import { SUSPICIOUS_KEYWORDS, HIGH_RISK_TLDS, SUSPICIOUS_PORTS } from '../config/rules';
+import { parseDomainHost } from './domainParser';
+import { decodePunycodeHostname } from './idn';
 
 /**
  * Parses and extracts deep security features from a URL
@@ -8,7 +10,7 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
   const signals: DetectionSignal[] = [];
   
   let cleanUrl = rawUrl.trim();
-  if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://') && !cleanUrl.startsWith('ftp://')) {
+  if (!/^(https?|ftp):\/\//i.test(cleanUrl)) {
     cleanUrl = 'https://' + cleanUrl;
   }
 
@@ -17,7 +19,7 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
     parsed = new URL(cleanUrl);
   } catch {
     try {
-      parsed = new URL('https://' + cleanUrl.replace(/^https?:\/\//, ''));
+      parsed = new URL('https://' + cleanUrl.replace(/^[a-z][a-z0-9+.-]*:\/\//i, ''));
     } catch {
       parsed = new URL('https://invalid-url-format.local');
     }
@@ -31,16 +33,16 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
   
   // 1. IP Address Detection (IPv4, IPv6, Hex, Integer formats)
   const ipv4Pattern = /^(\d{1,3}\.){3}\d{1,3}$/;
-  const ipv6Pattern = /^\[?([a-f0-9:]+)\]?$/i;
   const hexIpPattern = /^0x[0-9a-f]+$/i;
   const intIpPattern = /^\d{8,12}$/;
   
   const isIpv4 = ipv4Pattern.test(hostname);
-  const isIpv6 = ipv6Pattern.test(hostname);
+  // URL.hostname includes square brackets for IPv6 literals.
+  const isIpv6 = hostname.startsWith('[') && hostname.endsWith(']');
   const isHexOrInt = hexIpPattern.test(hostname) || intIpPattern.test(hostname);
   const isIpAddress = isIpv4 || isIpv6 || isHexOrInt;
 
-  if (isIpAddress && hostname !== '127.0.0.1' && hostname !== 'localhost' && hostname !== '::1') {
+  if (isIpAddress && hostname !== '127.0.0.1' && hostname !== 'localhost' && hostname !== '[::1]') {
     signals.push({
       id: 'SIGNAL_IP_HOST',
       category: 'URL_STRUCTURE',
@@ -55,11 +57,11 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
   }
 
   // 2. Punycode & IDN Homograph Analysis
-  const isPunycode = hostname.startsWith('xn--') || hostname.includes('.xn--');
+  const isPunycode = hostname.split('.').some(part => part.startsWith('xn--'));
   let decodedPunycode: string | undefined;
   
   if (isPunycode) {
-    decodedPunycode = hostname.split('.').map(part => part.startsWith('xn--') ? `[Unicode:${part.substring(4)}]` : part).join('.');
+    decodedPunycode = decodePunycodeHostname(hostname);
     signals.push({
       id: 'SIGNAL_PUNYCODE_IDN',
       category: 'URL_STRUCTURE',
@@ -73,9 +75,16 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
     });
   }
 
-  // Check for non-ASCII characters directly in host
-  const hasNonAsciiInHost = /[^\u0000-\u007F]/.test(hostname);
-  if (hasNonAsciiInHost) {
+  // URL.hostname is ASCII/Punycode. Inspect the original authority for Unicode.
+  const rawAuthority = rawUrl.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[\/?#]/, 1)[0];
+  const rawHostPort = rawAuthority.slice(rawAuthority.lastIndexOf('@') + 1);
+  const rawHost = rawHostPort.startsWith('[')
+    ? rawHostPort.slice(0, rawHostPort.indexOf(']') + 1)
+    : rawHostPort.replace(/:\d+$/, '');
+  const hasNonAsciiInHost = /[^\u0000-\u007F]/.test(rawHost);
+  // A Unicode hostname is normally converted to Punycode by URL. Avoid
+  // double-counting the same IDN observation as two independent risk signals.
+  if (hasNonAsciiInHost && !isPunycode) {
     signals.push({
       id: 'SIGNAL_NON_ASCII_DOMAIN',
       category: 'URL_STRUCTURE',
@@ -85,28 +94,13 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
       title: 'Non-ASCII Characters in Hostname',
       description: 'Hostname contains raw Unicode characters outside standard ASCII, which is a common homograph attack technique.',
       confidence: 0.95,
-      evidence: { hostname }
+      evidence: { hostname: rawHost }
     });
   }
 
   // 3. Subdomain Depth and Structure Analysis
   const domainParts = hostname.split('.').filter(Boolean);
-  let effectiveDomain = hostname;
-  let subdomainCount = 0;
-
-  // Basic TLD handling (including common 2-part ccTLDs)
-  const twoPartTlds = ['co.uk', 'com.au', 'co.nz', 'co.jp', 'com.br', 'co.za', 'gov.uk', 'edu.au', 'com.sg', 'co.il'];
-  const hasTwoPartTld = twoPartTlds.some(t => hostname.endsWith('.' + t));
-  
-  if (domainParts.length >= 2) {
-    if (hasTwoPartTld && domainParts.length >= 3) {
-      effectiveDomain = domainParts.slice(-3).join('.');
-      subdomainCount = domainParts.length - 3;
-    } else {
-      effectiveDomain = domainParts.slice(-2).join('.');
-      subdomainCount = domainParts.length - 2;
-    }
-  }
+  const { registeredDomain: effectiveDomain, subdomainCount } = parseDomainHost(hostname);
 
   const tld = domainParts.length > 0 ? domainParts[domainParts.length - 1] : '';
 
@@ -127,17 +121,7 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
 
   // 4. Deceptive '@' Userinfo Spoofing
   // Accurate RFC 3986 check: only trigger if username/password userinfo component is actually present in URL authority
-  const hasUserinfo = Boolean(parsed.username || parsed.password) || (
-    rawUrl.includes('@') && (() => {
-      try {
-        const withoutProto = rawUrl.replace(/^[a-zA-Z]+:\/\//, '');
-        const authority = withoutProto.split('/')[0].split('?')[0].split('#')[0];
-        return authority.includes('@');
-      } catch {
-        return false;
-      }
-    })()
-  );
+  const hasUserinfo = Boolean(parsed.username || parsed.password) || rawAuthority.includes('@');
 
   if (hasUserinfo) {
     signals.push({
@@ -170,7 +154,7 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
   }
 
   // 6. Insecure HTTP Protocol
-  if (protocol === 'http' && hostname !== 'localhost' && hostname !== '127.0.0.1') {
+  if (protocol === 'http' && hostname !== 'localhost' && hostname !== '127.0.0.1' && hostname !== '[::1]') {
     signals.push({
       id: 'SIGNAL_INSECURE_HTTP',
       category: 'URL_STRUCTURE',
@@ -211,7 +195,7 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
   }
 
   if (matchedKeywords.length >= 2) {
-    const isMainDomainKeyword = domainParts.length >= 2 && matchedKeywords.includes(domainParts[domainParts.length - 2]);
+    const isMainDomainKeyword = matchedKeywords.includes(effectiveDomain.split('.')[0]);
     const weight = isMainDomainKeyword ? 18 : 28;
     
     signals.push({
@@ -284,6 +268,7 @@ export function extractUrlFeatures(rawUrl: string): { features: UrlFeatures; sig
     isIpAddress,
     isPunycode,
     decodedPunycode,
+    hasNonAsciiInHost,
     subdomainCount,
     domainParts,
     tld,

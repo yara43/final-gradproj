@@ -20,6 +20,8 @@ async function buildExtension() {
     { in: 'src/core/config/brands.ts', out: 'extension/config/brands.js' },
     { in: 'src/core/config/rules.ts', out: 'extension/config/rules.js' },
     { in: 'src/core/config/trustedProviders.ts', out: 'extension/config/trustedProviders.js' },
+    { in: 'src/core/engine/domainParser.ts', out: 'extension/engine/domainParser.js' },
+    { in: 'src/core/engine/idn.ts', out: 'extension/engine/idn.js' },
     { in: 'src/core/engine/brandIdentity.ts', out: 'extension/engine/brandIdentity.js' },
     { in: 'src/core/engine/urlAnalysis.ts', out: 'extension/engine/urlAnalysis.js' },
     { in: 'src/core/engine/typosquatting.ts', out: 'extension/engine/typosquatting.js' },
@@ -54,7 +56,8 @@ async function buildExtension() {
       format: 'esm',
       target: 'es2022',
       platform: 'browser',
-      bundle: false,
+      // Chrome MV3 cannot load npm imports directly; bundle tldts locally once.
+      bundle: f.in === 'src/core/engine/domainParser.ts',
       minify: false,
       sourcemap: false
     });

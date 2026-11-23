@@ -1,0 +1,38 @@
+name: Verify and sync Chrome extension
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify-extension.yml'
+      - 'src/core/**'
+      - 'scripts/buildExtension.ts'
+      - 'scripts/test-domain-parser.mjs'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm install
+      - run: npm run build:extension
+      - run: npm run test:domain
+      - run: npm test
+      - name: Commit generated Chrome extension files
+        run: |
+          git add package-lock.json extension/config extension/engine extension/events extension/logging
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Build Chrome extension after URL analysis changes'
+          git push

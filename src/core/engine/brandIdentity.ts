@@ -5,7 +5,8 @@
  * 1. BRAND IDENTITY: The real-world entity (e.g., "Vinted", "Jumia", "PayPal", "Apple", "Acme Bank")
  *    - Layer A: Known Protected Brand Engine (High-confidence curated registry)
  *    - Layer B: Generalized / Inferred Identity Engine (Arbitrary brands inferred from DOM, meta, title, headings, and tokens)
- * 2. REGISTERED DOMAIN (eTLD+1): The root registered domain (e.g., "vinted.com", "netlify.app", "vercel.app", "jumia.com")
+ * 2. REGISTERED DOMAIN (eTLD+1, including private suffixes): The registrable site
+ *    (e.g., "vinted.com", "alice.netlify.app", "bob.vercel.app", "jumia.com")
  * 3. HOSTNAME: The full network name (e.g., "vintedmarket.netlify.app", "jumia.vercel.app", "accounts.google.com")
  * 
  * Identifies brand domain mismatches and impersonations across:
@@ -15,6 +16,7 @@
  */
 
 import { FormAnalysisMetadata, SocialEngineeringMetadata } from '../types';
+import { parseDomainHost } from './domainParser';
 
 export interface BrandIdentity {
   id: string;
@@ -235,7 +237,7 @@ export const FREE_HOSTING_PROVIDERS: Record<string, string> = {
 };
 
 /**
- * Robust Registered Domain Extraction (eTLD+1 approximation)
+ * Registered domain extraction using the Public Suffix List, including private suffixes.
  */
 export function sharedHost(hostname: string) {
   return Object.keys(FREE_HOSTING_PROVIDERS).find(provider =>
@@ -244,21 +246,7 @@ export function sharedHost(hostname: string) {
 }
 
 export function extractRegisteredDomain(hostname: string): string {
-  const clean = hostname.toLowerCase().trim();
-  const parts = clean.split('.');
-  if (parts.length <= 2) return clean;
-
-  const multiPartTlds = [
-    'co.uk', 'com.au', 'co.nz', 'co.jp', 'com.br', 'co.za', 'gov.uk', 'edu.au',
-    'com.sg', 'co.il', 'com.ng', 'co.ke', 'com.gh', 'com.eg', 'net.au', 'org.uk'
-  ];
-
-  const lastTwo = parts.slice(-2).join('.');
-  if (multiPartTlds.includes(lastTwo) && parts.length >= 3) {
-    return parts.slice(-3).join('.');
-  }
-
-  return parts.slice(-2).join('.');
+  return parseDomainHost(hostname).registeredDomain;
 }
 
 export interface BrandEvaluationResult {

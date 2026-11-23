@@ -8,6 +8,29 @@ The page collector and identity engine changed together so that a newspaper subs
 
 # PhishGuard
 
+### Public Suffix List domain parsing
+
+`src/core/engine/domainParser.ts` imports `tldts` and parses hostnames with
+`allowPrivateDomains: true`. This replaces the short hand-written two-part TLD
+lists in URL analysis and brand identity. For example, `alice.github.io` and
+`bob.github.io` are now separate registrable tenants, while
+`a.b.example.co.uk` has two subdomains. The curated free-hosting provider list
+still decides whether a host is shared infrastructure; the Public Suffix List
+alone is not a malicious-site verdict.
+
+`urlAnalysis.ts` also checks IPv6 literals correctly and decodes Punycode for
+human-readable evidence. The Unicode check reads the original URL authority;
+the browser's `URL.hostname` has already converted IDNs to ASCII. A Unicode
+host and its Punycode form count as one IDN observation in the score. The
+decoder is browser-compatible and does not import Node's `url` module.
+
+Run `npm install`, then `npm run build:extension`, then `npm run test:domain`.
+Chrome's unpacked extension loads `extension/`, so reload it at
+`chrome://extensions` after rebuilding. The build bundles the library into a
+local extension module; it does not fetch code from a CDN at runtime.
+The `Verify and sync Chrome extension` GitHub Action also builds, tests, and
+commits the generated `extension/` engine files after source changes on `main`.
+
 Privacy-focused Chrome extension for detecting phishing, typosquatting, and suspicious credential forms in real time.
 
 ---
