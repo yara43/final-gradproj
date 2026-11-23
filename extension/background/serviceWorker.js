@@ -3,7 +3,7 @@ import { DEFAULT_SETTINGS } from '../config/rules.js';
 import { globalEventStore } from '../events/eventStore.js';
 import { createNetworkSecurityEvent } from '../events/networkEvents.js';
 import { createPageBrandingEvent } from '../events/pageEvents.js';
-import { createFormSecurityEvent } from '../events/formEvents.js';
+import { parseHttpUrl } from '../engine/formDestinations.js';
 import { createNavigationSecurityEvent } from '../events/navigationEvents.js';
 import { createDownloadSecurityEvent } from '../events/downloadEvents.js';
 import { correlateSecurityEvents } from '../events/eventCorrelator.js';
@@ -115,42 +115,31 @@ async function performTabScan(tabId, url, formMetadata = null, socialMeta = null
 
   const downloadContext = tabDownloadContexts.get(tabId) || null;
 
-  if (formMetadata) {
-    tabDomMetadata.set(tabId, { formMetadata, socialMeta });
-  } else if (tabDomMetadata.has(tabId)) {
-    const cached = tabDomMetadata.get(tabId);
+  const cached = tabDomMetadata.get(tabId);
+  if (!formMetadata && cached?.url === url) {
     formMetadata = cached.formMetadata;
     socialMeta = cached.socialMeta;
   }
 
-  // 1. Evaluate Core Rules Analysis
-  const analysis = analyzePageSecurity(
-    url,
-    formMetadata,
-    redirectData,
-    settings,
-    socialMeta,
-    downloadContext
-  );
-
-  // 2. Correlate Real-Time Behavioral Events from EventStore
   const tabEvents = globalEventStore.getTabEvents(tabId);
-  const correlated = correlateSecurityEvents({tabId, url, domain: analysis.domain, events: tabEvents, ...analysis.features?.reputation});
+  if (formMetadata && cached?.url === url) {
+    const observedDestinations = tabEvents.filter(event =>
+      event.type === 'CREDENTIAL_SUBMISSION_PATTERN' && event.documentId === cached.documentId
+    ).map(event => event.destinationUrl);
+    formMetadata = { ...formMetadata, observedDestinations };
+  }
 
-  // If compound event correlation identified higher severity threats, merge signals
+  const analysis = analyzePageSecurity(url, formMetadata, redirectData, settings, socialMeta, downloadContext);
+  const correlated = correlateSecurityEvents({
+    tabId, url, domain: analysis.domain,
+    events: tabEvents.filter(event => event.type !== 'CREDENTIAL_SUBMISSION_PATTERN'),
+    ...analysis.features?.reputation
+  });
+
   if (settings.protectionEnabled && correlated.score > analysis.score) {
-    analysis.score = Math.min(100, Math.max(analysis.score, correlated.score));
+    analysis.score = correlated.score;
     analysis.verdict = correlated.verdict;
     analysis.severity = correlated.severity;
-    
-    // Add compound signals to analysis
-    analysis.reasons = [...new Set([...correlated.reasons, ...analysis.reasons])];
-    for (const ev of correlated.evidence) {
-      const sig = {...ev, description: ev.explanation, category: 'BEHAVIORAL', evidence: ev.evidenceMetadata};
-      if (!analysis.signals.some(s => s.type === sig.type)) {
-        analysis.signals.push(sig);
-      }
-    }
   }
 
   tabScanResults.set(tabId, analysis);
@@ -190,20 +179,25 @@ async function performTabScan(tabId, url, formMetadata = null, socialMeta = null
       chrome.tabs.sendMessage(tabId, {
         type: 'PHISHGUARD_SHOW_BANNER',
         analysis
-      });
+      }).catch(() => {});
     } catch {
       // Content script may not be initialized yet
     }
 
     // If score meets or exceeds blockThreshold, navigate to warning interstitial
+    // If score meets or exceeds blockThreshold, navigate to warning interstitial
     if (analysis.score >= settings.blockThreshold) {
+      await setSessionData(`warning_${tabId}`, {
+        ...analysis,
+        url
+      });
+
       chrome.tabs.update(tabId, { url: warningUrl });
     }
   }
 
   return analysis;
 }
-
 /**
  * STEP 2: Dispatches structured, privacy-preserving observation event to PhishGuard VPS API
  * 
@@ -218,9 +212,9 @@ async function dispatchTelemetryToVPS(url, analysis, formMetadata, redirectData,
   try {
     const endpoint = settings.telemetryEndpoint || '/api/telemetry';
     
-    const payload = {
+        const payload = {
       event_type: 'page_analysis',
-      url: url,
+      url: parseHttpUrl(url)?.origin ?? '',
       domain: analysis.domain,
       title: formMetadata?.pageTitle || '',
       forms: {
@@ -230,12 +224,14 @@ async function dispatchTelemetryToVPS(url, analysis, formMetadata, redirectData,
         ssn: !!formMetadata?.hasSsnInput
       },
       cross_origin_forms: (formMetadata?.suspiciousForms || []).map(f => ({
-        action: f.action,
+       action: parseHttpUrl(f.action)?.origin ?? '',
         method: f.method,
         is_cross_origin: f.isCrossOrigin,
         has_password: f.hasPasswordField
       })),
-      redirects: (redirectData?.hops || []).map(h => h.url),
+      redirects: (redirectData?.hops || [])
+  .map(h => parseHttpUrl(h.url)?.origin)
+  .filter(Boolean),
       detected_brands: analysis.targetBrand ? [analysis.targetBrand.name] : [],
       timestamp: new Date().toISOString()
     };
@@ -298,42 +294,39 @@ async function recordScanHistory(analysis) {
 if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
   chrome.webRequest.onBeforeRequest.addListener(
     (details) => {
-      if (details.tabId <= 0) return; // Background or internal browser request
+      if (details.tabId < 0 || details.frameId !== 0 || !details.documentId) return;
+      if (!['POST', 'PUT', 'PATCH'].includes(details.method)) return;
 
-      const targetUrl = details.url;
-      const method = details.method || 'GET';
-      const initiator = details.initiator || '';
+      const context = tabDomMetadata.get(details.tabId);
+      if (!context || context.documentId !== details.documentId ||
+          !context.formMetadata.suspiciousForms?.some(form => form.hasPasswordField)) return;
 
-      if (!targetUrl || targetUrl.startsWith('chrome-extension://') || targetUrl.startsWith('data:')) {
-        return;
-      }
+      const page = parseHttpUrl(context.url);
+      const destination = parseHttpUrl(details.url);
+      if (!page || !destination || details.initiator !== page.origin) return;
 
-      try {
-        let pageUrl = initiator;
-        const currentResult = tabScanResults.get(details.tabId);
-        if (currentResult && currentResult.url) {
-          pageUrl = currentResult.url;
-        }
+      const event = createNetworkSecurityEvent({
+        tabId: details.tabId,
+        frameId: details.frameId,
+        documentId: details.documentId,
+        pageUrl: page.origin,
+        requestUrl: destination.origin,
+        method: details.method,
+        type: details.type,
+        timeStamp: details.timeStamp
+      }, true);
 
-        if (pageUrl) {
-          const networkEvent = createNetworkSecurityEvent({tabId: details.tabId, pageUrl, requestUrl: targetUrl, method, type: details.type}, !!tabDomMetadata.get(details.tabId)?.formMetadata?.hasPasswordInput);
-          if (networkEvent) {
-            globalEventStore.recordEvent(networkEvent);
+      if (!event.sensitiveSubmissionPattern) return;
+      const alreadyObserved = globalEventStore.getTabEvents(details.tabId).some(previous =>
+        previous.documentId === event.documentId && previous.type === event.type &&
+        previous.destinationUrl === event.destinationUrl && previous.method === event.method
+      );
+      if (alreadyObserved) return;
+      globalEventStore.recordEvent(event);
+      performTabScan(details.tabId, context.url).catch(() => {});
 
-            // If a cross-origin POST happens on a page with credential inputs, re-evaluate tab scan
-            if (networkEvent.isCrossOrigin && method === 'POST') {
-              const domMeta = tabDomMetadata.get(details.tabId);
-              if (domMeta?.formMetadata?.hasPasswordInput || domMeta?.formMetadata?.has2FAInput) {
-                performTabScan(details.tabId, pageUrl);
-              }
-            }
-          }
-        }
-      } catch {
-        // Safe failover
-      }
     },
-    { urls: ['<all_urls>'] }
+    { urls: ['http://*/*', 'https://*/*'], types: ['xmlhttprequest'] }
   );
 }
 
@@ -344,6 +337,7 @@ chrome.webNavigation.onBeforeNavigate.addListener((details) => {
   if (details.frameId !== 0) return; // Top-level frame only
 
   const tabId = details.tabId;
+  tabDomMetadata.delete(tabId);
   const existingHistory = tabRedirectHistory.get(tabId);
 
   if (!existingHistory) {
@@ -385,8 +379,7 @@ chrome.webNavigation.onCommitted.addListener((details) => {
     globalEventStore.clearTab(tabId);
   }
 
-  tabDomMetadata.delete(tabId);
-  const navEvent = createNavigationSecurityEvent({tabId, url: details.url, previousUrl: history.hops.at(-2)?.url, transitionType: details.transitionType}, history.hops.map(h => h.url));
+  const navEvent = createNavigationSecurityEvent({ tabId, url: details.url }, history.hops.map(h => h.url));
   if (navEvent) {
     globalEventStore.recordEvent(navEvent);
   }
@@ -424,7 +417,7 @@ if (chrome.downloads && chrome.downloads.onCreated) {
 
         tabDownloadContexts.set(activeTab.id, downloadContext);
 
-        const dlEvent = createDownloadSecurityEvent({tabId: activeTab.id, downloadId: downloadItem.id, originUrl: activeTab.url || "", url: downloadItem.url, filename, originRiskScore});
+        const dlEvent = createDownloadSecurityEvent({ tabId: activeTab.id, ...downloadContext });
         if (dlEvent) {
           globalEventStore.recordEvent(dlEvent);
         }
@@ -474,22 +467,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // 1. Content Script Reports DOM Form & Social Engineering Metadata
   if (message.type === 'PHISHGUARD_DOM_METADATA') {
     const tabId = sender.tab?.id;
-    const url = sender.tab?.url || message.url;
-    if (tabId && url) {
-      // Record Form Security Event
-      for (const form of message.formMetadata?.suspiciousForms || []) {
-        globalEventStore.recordEvent(createFormSecurityEvent({...form, tabId, pageUrl: url, hiddenFieldCount: form.hiddenInputsCount}));
-      }
-
-      // Record Page Branding Event
-      const pageTitle = message.formMetadata?.pageTitle || '';
-      const visibleHeadings = message.socialMeta?.visibleHeadingsSample || [];
-      const brandEvent = createPageBrandingEvent({tabId, url, title: pageTitle, headings: visibleHeadings, formMetadata: message.formMetadata});
+    const url = sender.url || message.url;
+    if (tabId != null && url && sender.frameId === 0 && message.formMetadata) {
+      const { formMetadata, socialMeta } = message;
+      tabDomMetadata.set(tabId, { url, documentId: sender.documentId, formMetadata, socialMeta });
+      const brandEvent = createPageBrandingEvent({
+        tabId, url, title: formMetadata.pageTitle, headings: socialMeta?.visibleHeadingsSample
+      });
       if (brandEvent) globalEventStore.recordEvent(brandEvent);
 
-      performTabScan(tabId, url, message.formMetadata, message.socialMeta).then(res => {
-        sendResponse({ success: true, result: res, analysis: res });
-      });
+      performTabScan(tabId, url, formMetadata, socialMeta).then(result => {
+        sendResponse({ success: true, result });
+      }).catch(() => sendResponse({ success: false }));
       return true; // async response
     }
   }

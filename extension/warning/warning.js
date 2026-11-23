@@ -1,4 +1,3 @@
-import { analyzePageSecurity } from '../engine/riskScoring.js';
 import { DEFAULT_SETTINGS } from '../config/rules.js';
 
 let targetUrl = '';
@@ -64,14 +63,29 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 async function loadSignals() {
-  const storage = await chrome.storage.local.get('settings');
-  const settings = storage.settings || DEFAULT_SETTINGS;
-  const analysis = analyzePageSecurity(targetUrl, null, null, settings);
+  const tab = await chrome.tabs.getCurrent();
+  const key = `warning_${tab?.id}`;
 
-  document.getElementById('targetScore').textContent = `${analysis.score} / 100`;
-  
+  const storage = await chrome.storage.session.get(key);
+  const analysis = storage[key];
+
   const riskBadge = document.getElementById('riskBadge');
-  riskBadge.textContent = analysis.score >= 80 ? 'CRITICAL RISK' : 'HIGH RISK';
+
+  if (!analysis || analysis.url !== targetUrl) {
+    document.getElementById('targetScore').textContent = 'Unavailable';
+    riskBadge.textContent = 'WARNING';
+    document.getElementById('signalsList').textContent =
+      'Original analysis is unavailable.';
+    return;
+  }
+
+  document.getElementById('targetScore').textContent =
+    `${analysis.score} / 100`;
+
+  riskBadge.textContent =
+    analysis.verdict === 'DANGEROUS'
+      ? 'CRITICAL RISK'
+      : analysis.verdict.replace(/_/g, ' ');
 
   const listContainer = document.getElementById('signalsList');
   listContainer.textContent = '';

@@ -45,6 +45,7 @@
     const allElements = root.querySelectorAll('*');
     for (const el of allElements) {
       if (el.shadowRoot) {
+        observer.observe(el.shadowRoot, observerOptions);
         results.push(...queryAllShadow(selector, el.shadowRoot));
       }
     }
@@ -57,81 +58,9 @@
   function inspectPageDOM() {
     lastScanTime = Date.now();
     try {
-      // 1. Password & Credential Input Detection (including shadow DOM)
-      const passwordInputs = queryAllShadow('input[type="password"]');
-      const hasPasswordInput = passwordInputs.length > 0;
-
-      const emailOrUserInputs = queryAllShadow(
-        'input[type="email"], input[name*="user" i], input[name*="login" i], input[id*="user" i], input[id*="login" i], input[autocomplete="username"], input[autocomplete="email"]'
+      const formMetadata = PhishGuardFormMetadata.extractDomMetadataFromDocument(
+        document, window.location.href, queryAllShadow, false
       );
-      const hasEmailOrUserInput = emailOrUserInputs.length > 0;
-
-      const ccInputs = queryAllShadow(
-        'input[name*="card" i], input[name*="cc-" i], input[name*="cvv" i], input[id*="card" i], input[autocomplete*="cc-" i]'
-      );
-      const hasCreditCardInput = ccInputs.length > 0;
-
-      const ssnInputs = queryAllShadow(
-        'input[name*="ssn" i], input[name*="social-security" i], input[id*="ssn" i]'
-      );
-      const hasSsnInput = ssnInputs.length > 0;
-
-      const twoFaInputs = queryAllShadow(
-        'input[name*="otp" i], input[name*="2fa" i], input[name*="token" i], input[id*="otp" i], input[id*="2fa" i], input[name*="seed" i], input[name*="mnemonic" i]'
-      );
-      const has2FAInput = twoFaInputs.length > 0;
-
-      const forms = queryAllShadow('form');
-      let hasHiddenCredentialFields = false;
-      const currentHost = window.location.hostname.toLowerCase();
-
-      const suspiciousForms = forms.map(form => {
-        const rawAction = form.getAttribute('action') || '';
-        let isCrossOrigin = false;
-        let isInsecureHttp = false;
-
-        if (rawAction && !rawAction.startsWith('javascript:') && !rawAction.startsWith('#')) {
-          try {
-            const actionUrl = new URL(rawAction, window.location.href);
-            const actionHost = actionUrl.hostname.toLowerCase();
-            isCrossOrigin = actionHost !== currentHost && !actionHost.endsWith('.' + currentHost);
-            isInsecureHttp = actionUrl.protocol === 'http:';
-          } catch {
-            // relative action or malformed
-          }
-        }
-
-        const formPasswordFields = form.querySelectorAll('input[type="password"]');
-        const hiddenInputs = form.querySelectorAll('input[type="hidden"]');
-        if (formPasswordFields.length > 0 && hiddenInputs.length > 5) {
-          hasHiddenCredentialFields = true;
-        }
-
-        return {
-          action: rawAction,
-          method: (form.getAttribute('method') || 'GET').toUpperCase(),
-          isCrossOrigin,
-          isInsecureHttp,
-          hasCreditCardField: !!form.querySelector('input[autocomplete^="cc-"],input[name*="card" i]'),
-          has2FAField: !!form.querySelector('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="2fa" i]'),
-          identityLabels: Array.from(form.querySelectorAll('legend,h1,h2,h3,button,label')).slice(0,12).filter(el => !el.closest('[contenteditable]')).map(el => Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join(' ').trim().slice(0,100)).filter(Boolean),
-          hasPasswordField: formPasswordFields.length > 0,
-          inputCount: form.querySelectorAll('input, select, textarea').length,
-          hiddenInputsCount: hiddenInputs.length
-        };
-      });
-
-      const formMetadata = {
-        hasPasswordInput,
-        hasCreditCardInput,
-        hasSsnInput,
-        hasEmailOrUserInput,
-        has2FAInput,
-        formsCount: forms.length,
-        suspiciousForms,
-        hasHiddenCredentialFields,
-        pageTitle: document.title
-      };
 
       // 2. Structural Social Engineering & Branding Text Inspection
       const visibleHeadingsSample = [];
@@ -178,7 +107,7 @@
         visibleHeadingsSample: visibleHeadingsSample.slice(0, 5)
       };
 
-      const stateHash = `${hasPasswordInput}_${hasCreditCardInput}_${forms.length}_${JSON.stringify(suspiciousForms.map(f => [f.hasPasswordField,f.has2FAField,f.identityLabels]))}_${detectedPhrases.length}_${document.title}`;
+      const stateHash = JSON.stringify([window.location.href, formMetadata, socialMeta]);
       if (stateHash === lastReportedHash) return;
       lastReportedHash = stateHash;
 
@@ -188,18 +117,24 @@
         url: window.location.href,
         formMetadata,
         socialMeta
-      }, (response) => {
-        if (response && response.analysis) {
-          currentAnalysis = response.analysis;
-          applyWarningExperience(response.analysis);
+         }, (response) => {
+        if (chrome.runtime.lastError || !response?.result) {
+          if (lastReportedHash === stateHash) {
+            lastReportedHash = '';
+          }
+          return;
+        }
+
+        if (lastReportedHash === stateHash) {
+          currentAnalysis = response.result;
         }
       });
 
     } catch (e) {
+      lastReportedHash = '';
       // Fail safely without disrupting host page
     }
   }
-
   // Pre-flight form submit security interception
   document.addEventListener('submit', (e) => {
     if (!currentAnalysis) return;
@@ -216,17 +151,18 @@
         const confirmed = window.confirm(
           `🛡️ PhishGuard Security Notice:\n\nThis website has been flagged as high-risk (${currentAnalysis.score}/100 - ${currentAnalysis.verdict}).\n\nSubmitting sensitive credentials or payment data here may expose your personal information.\n\nAre you sure you want to proceed?`
         );
-
         if (confirmed) {
           isWarningDismissedForSession = true;
-          form.submit();
+
+          if (e.submitter) {
+            form.requestSubmit(e.submitter);
+          } else {
+            form.requestSubmit();
+          }
         }
       }
     }
   }, true);
-
-  // Initial scan at document idle
-  inspectPageDOM();
 
   // Throttled MutationObserver with Max-Wait Guarantee for dynamic single-page applications
   const observer = new MutationObserver(() => {
@@ -243,11 +179,42 @@
     }, THROTTLE_MS);
   });
 
-  observer.observe(document.documentElement, {
+  const observerOptions = {
     childList: true,
-    subtree: true
-  });
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['action', 'method', 'formaction', 'formmethod', 'type', 'name',
+            'id', 'autocomplete', 'form', 'href']
+  };
+  observer.observe(document.documentElement, observerOptions);
+  observer.observe(document.documentElement, observerOptions);
 
+  let lastPageUrl = window.location.href;
+
+  function checkNavigation() {
+    if (window.location.href === lastPageUrl) return;
+
+    lastPageUrl = window.location.href;
+    currentAnalysis = null;
+    lastReportedHash = '';
+    isWarningDismissedForSession = false;
+
+    document.getElementById('phishguard-warning-banner')?.remove();
+    document.getElementById('phishguard-risk-modal')?.remove();
+
+    if (mutationTimeout) {
+      clearTimeout(mutationTimeout);
+      mutationTimeout = null;
+    }
+
+    inspectPageDOM();
+  }
+
+  window.addEventListener('popstate', checkNavigation);
+  window.addEventListener('hashchange', checkNavigation);
+  setInterval(checkNavigation, 1000);
+
+  inspectPageDOM();
   // Message listener for in-page security alerts from background
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === 'PHISHGUARD_SHOW_BANNER' && message.analysis) {

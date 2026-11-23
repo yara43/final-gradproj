@@ -1,14 +1,16 @@
+import { isSameSite, parseHttpUrl } from './formDestinations.js';
+import { extractDomMetadataFromDocument } from './formMetadata.js';
 import { isTrustedFederatedProvider } from '../config/trustedProviders.js';
 function evaluateFormSecurity(pageUrl, formMeta) {
   const signals = [];
   if (!formMeta) return signals;
-  let pageHost = "";
-  try {
-    const parsed = new URL(pageUrl.startsWith("http") ? pageUrl : "https://" + pageUrl);
-    pageHost = parsed.hostname.toLowerCase();
-  } catch {
-    pageHost = pageUrl.toLowerCase();
-  }
+  const page = parseHttpUrl(pageUrl) ?? parseHttpUrl(`https://${pageUrl}`);
+  const pageHost = page?.hostname ?? "";
+  const submissions = (formMeta.suspiciousForms || []).filter((form) => form.hasPasswordField).flatMap((form) => {
+    if (form.hasHttpDestination === false || form.method.toUpperCase() === "DIALOG") return [];
+    const destination = parseHttpUrl(form.action, page?.href);
+    return destination ? [{ form, destination }] : [];
+  });
   if (formMeta.hasPasswordInput) {
     signals.push({
       id: "SIGNAL_PASSWORD_INPUT_PRESENT",
@@ -33,7 +35,7 @@ function evaluateFormSecurity(pageUrl, formMeta) {
       confidence: 0.9
     });
   }
-  const insecureForms = (formMeta.suspiciousForms || []).filter((f) => f.isInsecureHttp);
+  const insecureForms = submissions.filter(({ destination }) => destination.protocol === "http:");
   if (insecureForms.length > 0) {
     signals.push({
       id: "SIGNAL_INSECURE_FORM_ACTION",
@@ -47,31 +49,51 @@ function evaluateFormSecurity(pageUrl, formMeta) {
       evidence: { insecureFormsCount: insecureForms.length }
     });
   }
-  const rogueCrossOriginForms = (formMeta.suspiciousForms || []).filter((f) => {
-    if (!f.isCrossOrigin || !f.hasPasswordField) return false;
-    let actionHost = "";
-    try {
-      actionHost = new URL(f.action, pageUrl).hostname.toLowerCase();
-    } catch {
-      actionHost = "";
-    }
-    const { isTrusted } = isTrustedFederatedProvider(actionHost);
-    return !isTrusted;
-  });
+  const rogueCrossOriginForms = submissions.filter(
+    ({ destination }) => page && destination.origin !== page.origin && !(destination.protocol === "https:" && isTrustedFederatedProvider(destination.hostname).isTrusted)
+  );
   if (rogueCrossOriginForms.length > 0) {
     signals.push({
-      id: "SIGNAL_CROSS_ORIGIN_CREDENTIAL_FORM",
+      id: "CROSS_ORIGIN_CREDENTIAL_HARVESTER",
       category: "DOM_SECURITY",
       type: "CROSS_ORIGIN_CREDENTIAL_HARVESTER",
       severity: "CRITICAL",
       weight: 60,
       title: "Cross-Origin Credential Form Action (Data Drop)",
-      description: "The login form submits entered credentials to an unrelated external domain. This is a primary signature of credential harvesters.",
-      confidence: 0.96,
+      description: "The login form submits entered credentials to a different origin. This is a primary signature of credential harvesters.",
+      confidence: 0.75,
       evidence: {
         pageHost,
-        crossOriginActions: rogueCrossOriginForms.map((f) => f.action)
+        crossOriginActions: [...new Set(rogueCrossOriginForms.map(({ destination }) => destination.origin))],
+        sameSite: rogueCrossOriginForms.every(({ destination }) => isSameSite(page, destination))
       }
+    });
+  }
+  if (submissions.some(({ form }) => form.method.toUpperCase() === "GET")) {
+    signals.push({
+      id: "SIGNAL_PASSWORD_FORM_GET",
+      category: "DOM_SECURITY",
+      type: "PASSWORD_FORM_GET_SUBMISSION",
+      severity: "MEDIUM",
+      weight: 25,
+      title: "Password Form Uses GET",
+      description: "A GET submission can expose passwords in URLs, history, and logs.",
+      confidence: 0.95
+    });
+  }
+  const observed = (formMeta.observedDestinations ?? []).map((value) => parseHttpUrl(value)).filter((destination) => destination && page && (destination.protocol === "http:" || destination.origin !== page.origin && !isTrustedFederatedProvider(destination.hostname).isTrusted));
+  if (observed.length) {
+    const usesHttp = observed.some((destination) => destination?.protocol === "http:");
+    signals.push({
+      id: "SIGNAL_POTENTIAL_JS_CREDENTIAL_SUBMISSION",
+      category: "DOM_SECURITY",
+      type: "POTENTIAL_JS_CREDENTIAL_SUBMISSION",
+      severity: usesHttp ? "HIGH" : "MEDIUM",
+      weight: usesHttp ? 40 : 35,
+      confidence: 0.55,
+      title: "Potential JavaScript Credential Submission",
+      description: "An asynchronous request used HTTP or targeted an untrusted origin while a password form was present.",
+      evidence: { destinations: [...new Set(observed.map((destination) => destination?.origin))] }
     });
   }
   if (formMeta.hasHiddenCredentialFields) {
@@ -99,88 +121,6 @@ function evaluateFormSecurity(pageUrl, formMeta) {
     });
   }
   return signals;
-}
-function extractDomMetadataFromDocument(doc, windowOrigin) {
-  const passwordInputs = doc.querySelectorAll('input[type="password"]');
-  const hasPasswordInput = passwordInputs.length > 0;
-  const emailOrUserInputs = doc.querySelectorAll(
-    'input[type="email"], input[name*="user" i], input[name*="login" i], input[id*="user" i], input[id*="login" i], input[autocomplete="username"], input[autocomplete="email"]'
-  );
-  const hasEmailOrUserInput = emailOrUserInputs.length > 0;
-  const ccInputs = doc.querySelectorAll(
-    'input[name*="card" i], input[name*="cc-" i], input[name*="cvv" i], input[id*="card" i], input[autocomplete*="cc-" i]'
-  );
-  const hasCreditCardInput = ccInputs.length > 0;
-  const ssnInputs = doc.querySelectorAll(
-    'input[name*="ssn" i], input[name*="social-security" i], input[id*="ssn" i]'
-  );
-  const hasSsnInput = ssnInputs.length > 0;
-  const twoFaInputs = doc.querySelectorAll(
-    'input[name*="otp" i], input[name*="2fa" i], input[name*="token" i], input[id*="otp" i], input[id*="2fa" i], input[name*="seed" i], input[name*="mnemonic" i]'
-  );
-  const has2FAInput = twoFaInputs.length > 0;
-  const forms = Array.from(doc.querySelectorAll("form"));
-  let hasHiddenCredentialFields = false;
-  let currentHost = "";
-  try {
-    currentHost = new URL(windowOrigin).hostname.toLowerCase();
-  } catch {
-    currentHost = windowOrigin.toLowerCase();
-  }
-  const suspiciousForms = forms.map((form) => {
-    const rawAction = form.getAttribute("action") || "";
-    let isCrossOrigin = false;
-    let isInsecureHttp = false;
-    if (rawAction && !rawAction.startsWith("javascript:") && !rawAction.startsWith("#")) {
-      try {
-        const actionUrl = new URL(rawAction, windowOrigin);
-        const actionHost = actionUrl.hostname.toLowerCase();
-        isCrossOrigin = actionHost !== currentHost && !actionHost.endsWith("." + currentHost);
-        isInsecureHttp = actionUrl.protocol === "http:";
-      } catch {
-      }
-    }
-    const formPasswordFields = form.querySelectorAll('input[type="password"]');
-    const hiddenInputs = form.querySelectorAll('input[type="hidden"]');
-    if (formPasswordFields.length > 0 && hiddenInputs.length > 5) {
-      hasHiddenCredentialFields = true;
-    }
-    return {
-      action: rawAction,
-      method: (form.getAttribute("method") || "GET").toUpperCase(),
-      isCrossOrigin,
-      isInsecureHttp,
-      hasCreditCardField: !!form.querySelector('input[autocomplete^="cc-"],input[name*="card" i]'),
-      has2FAField: !!form.querySelector('input[autocomplete="one-time-code"], input[name*="otp" i], input[name*="2fa" i]'),
-      identityLabels: Array.from(form.querySelectorAll("legend,h1,h2,h3,button,label")).slice(0, 12).filter((el) => !el.closest("[contenteditable]")).map((el) => Array.from(el.childNodes).filter((n) => n.nodeType === 3).map((n) => n.textContent).join(" ").trim().slice(0, 100)).filter(Boolean),
-      hasPasswordField: formPasswordFields.length > 0,
-      inputCount: form.querySelectorAll("input, select, textarea").length,
-      hiddenInputsCount: hiddenInputs.length
-    };
-  });
-  const externalScripts = [];
-  try {
-    const scriptTags = Array.from(doc.querySelectorAll("script[src]"));
-    for (const s of scriptTags.slice(0, 10)) {
-      const src = s.getAttribute("src");
-      if (src && src.startsWith("http")) {
-        externalScripts.push(src);
-      }
-    }
-  } catch {
-  }
-  return {
-    hasPasswordInput,
-    hasCreditCardInput,
-    hasSsnInput,
-    hasEmailOrUserInput,
-    has2FAInput,
-    formsCount: forms.length,
-    suspiciousForms,
-    hasHiddenCredentialFields,
-    hasExternalScriptSources: externalScripts,
-    pageTitle: doc.title
-  };
 }
 export {
   evaluateFormSecurity,
